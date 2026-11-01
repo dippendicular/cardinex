@@ -1,0 +1,14 @@
+services:
+  cardinex:
+    build: .
+    environment:
+      ADDR: ":8080"
+      REDIS_ADDR: "redis:6379"
+    ports:
+      - "8080:8080"
+    depends_on:
+      - redis
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
