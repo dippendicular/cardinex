@@ -1,0 +1,23 @@
+{
+  "name": "cardinex",
+  "version": "0.1.0",
+  "description": "Mergeable sketches with guaranteed error intervals: semantic GROUP BY over embeddings, HyperLogLog, Count-Min, Bloom.",
+  "main": "index.js",
+  "license": "MIT",
+  "repository": "github:dippendicular/cardinex",
+  "gypfile": true,
+  "files": ["index.js", "src", "binding.gyp", "prebuilds"],
+  "scripts": {
+    "install": "node-gyp-build",
+    "prebuild": "prebuildify --napi --strip",
+    "test": "node test/conformance.js"
+  },
+  "dependencies": {
+    "node-addon-api": "^8.0.0",
+    "node-gyp-build": "^4.8.0"
+  },
+  "devDependencies": {
+    "prebuildify": "^6.0.0"
+  },
+  "engines": { "node": ">=18" }
+}

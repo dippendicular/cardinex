@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PackageId>Cardinex</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Dip Chakraborty</Authors>
+    <Description>Mergeable sketches with guaranteed error intervals.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <RepositoryUrl>https://github.com/dippendicular/cardinex</RepositoryUrl>
+  </PropertyGroup>
+  <!-- CI copies dist/<rid>/ into runtimes/<rid>/native/ before pack. -->
+  <ItemGroup>
+    <None Include="runtimes/**/*" Pack="true" PackagePath="runtimes" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

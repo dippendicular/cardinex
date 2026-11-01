@@ -1,0 +1,99 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  go:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - run: go vet ./...
+      - run: go test ./...
+      - if: runner.os == 'Linux'
+        run: go test -race ./...
+
+  lib:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - run: bash scripts/build-lib.sh dist
+        shell: bash
+      - uses: actions/upload-artifact@v4
+        with: { name: "lib-${{ matrix.os }}", path: dist }
+
+  sdks:
+    needs: lib
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with: { name: "lib-${{ matrix.os }}", path: dist }
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: python
+        shell: bash
+        run: |
+          cp dist/*cardinex* sdk/python/cardinex/
+          pip install ./sdk/python pytest
+          pytest sdk/python/tests
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: node
+        shell: bash
+        run: cd sdk/node && npm install --build-from-source && cp ../../dist/*cardinex* build/Release/ && npm test
+      - uses: actions/setup-dotnet@v4
+        with: { dotnet-version: "8.0.x" }
+      - name: csharp
+        shell: bash
+        run: |
+          cp dist/*cardinex* sdk/csharp/Cardinex.Conformance/ || true
+          dotnet run --project sdk/csharp/Cardinex.Conformance -- conformance
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "22" }
+      - name: java
+        shell: bash
+        run: |
+          lib=$(ls "$PWD"/dist/*cardinex.{so,dylib,dll} 2>/dev/null | head -1)
+          cd sdk/java && mvn -q test -Dcardinex.lib="$lib"
+      - name: cpp
+        if: runner.os != 'Windows'
+        run: |
+          cmake -S sdk/cpp -B build/cpp -DCARDINEX_LIB_DIR=$PWD/dist
+          cmake --build build/cpp
+          LD_LIBRARY_PATH=$PWD/dist DYLD_LIBRARY_PATH=$PWD/dist ./build/cpp/conformance conformance
+      - uses: dtolnay/rust-toolchain@stable
+      - name: rust
+        if: runner.os != 'Windows'
+        run: cd sdk/rust && LD_LIBRARY_PATH=$PWD/../../dist DYLD_LIBRARY_PATH=$PWD/../../dist CARDINEX_LIB_DIR=$PWD/../../dist cargo test
+
+  wheels:
+    if: startsWith(github.ref, 'refs/tags/')
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, macos-13, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with: { go-version: "1.24" }
+      - uses: pypa/cibuildwheel@v2.21
+        with: { package-dir: sdk/python }
+      - uses: actions/upload-artifact@v4
+        with: { name: "wheels-${{ matrix.os }}", path: wheelhouse }

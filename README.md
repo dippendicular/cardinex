@@ -1,144 +1,90 @@
 # Cardinex
 
-Cardinex is a dependency-free Go core library for probabilistic data structures plus a Chi/Redis HTTP service.
+A probabilistic data structure for **semantic GROUP BY**: per-entity count, sum, and mean over embedding streams, where near-duplicate vectors count as one entity. Bounded memory, single pass, mergeable across workers, with a guaranteed error interval on every answer.
 
-Import the core module:
+It also ships the classic exact-key sketches (HyperLogLog, Count-Min, Bloom) on the same binary format.
+
+> If your vectors fit in memory, the data is static, and a global pass is fine, run FAISS k-means instead. Cardinex is for data that is distributed, continuously updated, or too large to hold.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `core/semantic` | The semantic aggregation sketch (ingest, quarantine, probation, merge, top-k, lookup, diff) |
+| `core/quant` | Seeded randomized-Hadamard rotation and 1/2/4-bit codes |
+| `core/classic` | HyperLogLog (6-bit registers, Ertl estimator), Count-Min (optional conservative update), Bloom |
+| `core/serial` | CDNX v1 binary envelope (little-endian, CRC-32C) |
+| `core/build`, `core/sketch`, `core/hashx`, `core/tuner` | Constructors, typed interfaces, XXH3 hashing, parameter planning |
+| `capi` | C ABI (`cardinex.h`), built with `-buildmode=c-shared` |
+| `sdk/` | Go, Python, C++, C#, Java, Node.js and Rust SDKs over the C ABI |
+| `service` | HTTP API and MCP server, Redis persistence |
+| `conformance` | Cross-language spec and golden files |
+| `bench` | Go microbenchmarks |
+| `experiments` | Research harness (not yet run) |
+
+## Go
 
 ```go
-import cardinex "github.com/dippendicular/cardinex/pkg"
+import "github.com/dippendicular/cardinex/sdk/go"
+
+s, _ := cardinex.NewSemantic(cardinex.DefaultSemanticParams(384, 0.6, 1))
+_ = s.Add(embedding, 0.7, itemID)
+for _, e := range s.TopK(10, cardinex.ByMean) {
+    fmt.Println(e.ID, e.Mean.Lower, e.Mean.Upper, e.Ambiguous)
+}
 ```
 
-Run the service:
+## Python
+
+```python
+import numpy as np, cardinex
+
+with cardinex.Semantic(dim=384, tau=0.6, seed=1) as s:
+    s.add_batch(embeddings.astype(np.float32), values=losses)   # zero-copy
+    print(s.topk(10, by="mean"))
+```
+
+## Service
 
 ```sh
 docker compose up --build
 ```
 
-## Sketches
+HTTP routes:
 
-All structures implement:
+- Classic sketches: `POST /sketches/{hll|cms|bloom}`, `POST /sketches/{id}/add`, `GET /sketches/{id}/query`.
+- Semantic sketches: `POST /semantic`, `POST /semantic/{id}/add-batch`, `GET /semantic/{id}/topk`, `POST /semantic/{id}/lookup`, `POST /semantic/{id}/diff`, `GET /semantic/{id}/exemplars/{entity}`.
+- Any sketch: `POST /sketches/merge`, `GET /sketches/{id}/stats`, `GET /sketches/{id}/export`, `POST /sketches/import`.
 
-```go
-type Sketch interface {
-    Add(item []byte)
-    Query(item []byte) interface{}
-    Merge(other Sketch) error
-    Serialize() []byte
-    Deserialize([]byte) error
-}
-```
+Behaviour:
 
-## HTTP API
+- Writes are idempotent by `batch_id`.
+- If you pass `tolerance`, any answer whose interval is wider than it comes back with `status: insufficient_confidence`.
+- `cardinex-mcp` serves the same operations as MCP tools over stdio: `create`, `add`, `merge`, `topk`, `query`, `diff`, `exemplars`, `stats`.
 
-- `POST /sketches/:type` creates `hll`, `cms`, or `bloom`. Pass explicit params, or `memory_bytes`, `error_rate`, and `expected_elements` for tuning.
-- `POST /sketches/:id/add` with `{"item":"user-123"}` inserts.
-- `GET /sketches/:id/query?item=user-123` queries.
-- `POST /sketches/merge` with `{"into":"id-a","from":"id-b"}` merges compatible sketches.
-- `GET /sketches/:id/stats` returns memory, error bound, estimate, and interval.
-- `DELETE /sketches/:id` destroys.
+Environment: `ADDR`, `REDIS_ADDR`, `FLUSH_INTERVAL` (default 5s), `LOG_WRITES` (default 1), `CARDINEX_API_KEY`.
 
-Sketch bytes are written to Redis after every mutation and loaded into memory on service startup.
-
-## Mathematics
-
-### HyperLogLog
-
-HyperLogLog hashes each item to 64 bits, uses the first `p` bits as a register index, and stores the maximum leading-zero rank seen in that register. With `m = 2^p` registers, the raw estimate is:
-
-```text
-E = alpha_m * m^2 / sum(2^-M[j])
-```
-
-The harmonic mean damps the effect of outlier registers. Cardinex applies the standard small-range linear-counting correction when `E <= 5m/2` and empty registers remain:
-
-```text
-E* = m * ln(m / V)
-```
-
-For very large estimates it applies:
-
-```text
-E* = -2^64 * ln(1 - E / 2^64)
-```
-
-The relative standard error is approximately:
-
-```text
-1.04 / sqrt(m)
-```
-
-Union is register-wise maximum, making distributed cardinality sketches mergeable without raw events.
-
-### Count-Min Sketch
-
-Count-Min Sketch has width `w` and depth `d`. Cardinex uses double hashing to generate a pairwise-independent family:
-
-```text
-h_i(x) = h1(x) + i*h2(x)
-```
-
-Each add increments one counter per row. Query returns the minimum counter, so estimates never undercount. With:
-
-```text
-w = ceil(e / epsilon)
-d = ceil(ln(1 / delta))
-```
-
-the estimate is within additive error `epsilon * total_count` with confidence `1 - delta`. Equivalently, the implemented defaults report:
-
-```text
-epsilon = e / w
-confidence = 1 - (1/e)^d
-```
-
-Merge is cell-wise addition for sketches with equal width and depth.
-
-### Bloom Filter
-
-For expected insertions `n` and desired false-positive probability `p`, the optimal bit array size is:
-
-```text
-m = -n * ln(p) / ln(2)^2
-```
-
-and the optimal number of hash probes is:
-
-```text
-k = (m / n) * ln(2)
-```
-
-Cardinex uses FNV-based double hashing. Inserted items are guaranteed to have zero false negatives because all `k` bits are set on insert and membership only fails when one of those bits is absent. False positives occur when other items happen to set the same bits:
-
-```text
-p ~= (1 - exp(-k*n/m))^k
-```
-
-Merge is bitwise OR for equal `m` and `k`.
-
-## Tuning Example: Unique Visitors Under 1 MB
-
-For high-traffic unique visitor counting, HyperLogLog is the natural fit. A 1 MB budget gives `m = 1,048,576` one-byte registers (`p = 20` would exceed the current implementation cap, so Cardinex selects `p = 18`, or 262,144 bytes). The expected relative error is:
-
-```text
-1.04 / sqrt(262144) = 0.00203
-```
-
-That is about `0.2%` relative error while using only 256 KB, leaving the rest of the budget for more sketches, replication overhead, or Redis key metadata.
-
-Use the tuner:
-
-```go
-plan, _ := tuner.Tune(1<<20, 0.01, 10_000_000)
-fmt.Println(plan.Comparison)
-```
-
-## Benchmark Output
-
-Run:
+## Building
 
 ```sh
-go test ./bench -run TestMarkdownBenchmarkTable -v
-go test ./bench -bench . -benchmem
+make build        # Go
+make lib          # dist/libcardinex.{so,dylib} or cardinex.dll (needs a C compiler)
+make conformance  # Go + Python conformance
+make cross        # all targets with zig cc
 ```
 
-The table test prints markdown rows with memory per element and actual versus theoretical error.
+## Guarantees
+
+Semantic count, sum and mean intervals are **guaranteed conditional on the η event**:
+
+- **Separation condition:** Δ > 4ρ + 4η + 2·band must hold.
+- **Values:** must lie in the declared [a, b].
+- **When the conditions fail:** ambiguous observations go to a quarantine ledger and are reported next to the counts, never folded into them.
+
+HLL intervals and the Count-Min lower bound are probabilistic. The Count-Min upper bound is guaranteed.
+
+Stored representatives are compressed embeddings, and embeddings can be partially inverted. Sketches reduce raw-data exposure, but they are not a privacy guarantee.
+
+## License
+
+MIT

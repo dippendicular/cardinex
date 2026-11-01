@@ -1,0 +1,38 @@
+# VCS and agent notes
+.git/
+.gitignore
+.agents/
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Not needed to build the service
+clients/
+experiments/
+bench/
+*.md
+LICENSE
+
+# Build and test output
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.*
+bin/
+dist/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
