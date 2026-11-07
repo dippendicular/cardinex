@@ -31,6 +31,7 @@ var (
 	ErrNameTaken    = &Error{Code: "name_taken", Msg: "a sketch with that name exists"}
 	ErrWrongKind    = &Error{Code: "wrong_kind", Msg: "operation not supported for this sketch kind"}
 	ErrIncompatible = &Error{Code: "incompatible", Msg: "sketches have different parameters"}
+	ErrUnavailable  = &Error{Code: "unavailable", Msg: "sketch persistence outcome is unresolved; reload before retrying"}
 )
 
 // Error is a client-facing error.
@@ -84,6 +85,10 @@ type Entry struct {
 	dirty   bool
 	logLen  int64
 	batches *batchSet
+	// blocked is set after a store error whose remote commit outcome cannot be
+	// known from the Store interface.  Fail closed rather than continue from a
+	// state that may disagree with the durable log.
+	blocked bool
 }
 
 // Registry owns the hosted sketches.
@@ -238,8 +243,10 @@ type WriteResult struct {
 	BatchID   string `json:"batch_id,omitempty"`
 }
 
-// Write applies a batch. A repeated non-empty batch ID is acknowledged
-// without being applied again.
+// Write prepares a batch on an isolated snapshot.  When durable logging is
+// enabled, its record is appended before the prepared state replaces the live
+// sketch. A repeated non-empty batch ID is acknowledged without being applied
+// again.
 func (r *Registry) Write(ctx context.Context, ref string, w writeEntry) (WriteResult, error) {
 	e, err := r.Get(ref)
 	if err != nil {
@@ -247,23 +254,51 @@ func (r *Registry) Write(ctx context.Context, ref string, w writeEntry) (WriteRe
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.blocked {
+		return WriteResult{}, ErrUnavailable
+	}
 	if w.BatchID != "" && e.batches.seen[w.BatchID] {
 		return WriteResult{Duplicate: true, BatchID: w.BatchID}, nil
 	}
-	n, err := apply(e.sk, w)
+	prepared, err := cloneSketch(e.sk)
+	if err != nil {
+		return WriteResult{}, fmt.Errorf("prepare write: %w", err)
+	}
+	n, err := apply(prepared, w)
 	if err != nil {
 		return WriteResult{}, err
 	}
+	if r.logWrites {
+		b, err := json.Marshal(w)
+		if err != nil {
+			return WriteResult{}, fmt.Errorf("encode write log: %w", err)
+		}
+		if err := r.store.Append(ctx, e.ID, b); err != nil {
+			e.blocked = true
+			return WriteResult{}, fmt.Errorf("durably append write: %w", err)
+		}
+	}
+	// Assignment and bookkeeping cannot fail while the entry lock is held.
+	// A durable record (when configured) therefore always precedes the
+	// visible state transition.
+	e.sk = prepared
 	e.batches.add(w.BatchID)
 	e.dirty = true
 	if r.logWrites {
-		b, _ := json.Marshal(w)
-		if err := r.store.Append(ctx, e.ID, b); err != nil {
-			return WriteResult{}, fmt.Errorf("applied in memory but not logged: %w", err)
-		}
 		e.logLen++
 	}
 	return WriteResult{Applied: true, Items: n, BatchID: w.BatchID}, nil
+}
+
+// cloneSketch uses the CDNX round trip so this registry-level transaction
+// works uniformly for every supported sketch without widening the public
+// sketch interface. Decode validates the prepared snapshot as a side effect.
+func cloneSketch(sk sketch.Sketch) (sketch.Sketch, error) {
+	b, err := sk.MarshalBinary()
+	if err != nil {
+		return nil, err
+	}
+	return Decode(b)
 }
 
 func apply(sk sketch.Sketch, w writeEntry) (int, error) {
@@ -320,7 +355,7 @@ func lockPair(a, b *Entry) func() {
 }
 
 // Merge folds from into into.
-func (r *Registry) Merge(ref, fromRef string) (*Entry, error) {
+func (r *Registry) Merge(ctx context.Context, ref, fromRef string) (*Entry, error) {
 	into, err := r.Get(ref)
 	if err != nil {
 		return nil, err
@@ -334,13 +369,38 @@ func (r *Registry) Merge(ref, fromRef string) (*Entry, error) {
 	}
 	unlock := lockPair(into, from)
 	defer unlock()
-	if err := into.sk.Merge(from.sk); err != nil {
+	if into.blocked || from.blocked {
+		return nil, ErrUnavailable
+	}
+	prepared, err := cloneSketch(into.sk)
+	if err != nil {
+		return nil, fmt.Errorf("prepare merge: %w", err)
+	}
+	if err := prepared.Merge(from.sk); err != nil {
 		if errors.Is(err, sketch.ErrIncompatible) {
 			return nil, ErrIncompatible
 		}
 		return nil, badRequest("%v", err)
 	}
+	if r.logWrites {
+		snap, err := prepared.MarshalBinary()
+		if err != nil {
+			return nil, fmt.Errorf("encode merged snapshot: %w", err)
+		}
+		meta := Meta{Name: into.Name, Kind: uint16(into.Kind), Batches: append([]string(nil), into.batches.order...)}
+		trim := into.logLen
+		if err := r.store.Save(ctx, into.ID, meta, snap, trim); err != nil {
+			into.blocked = true
+			return nil, fmt.Errorf("durably save merge: %w", err)
+		}
+		into.logLen -= trim
+		into.dirty = false
+	}
+	into.sk = prepared
 	into.dirty = true
+	if r.logWrites {
+		into.dirty = false
+	}
 	return into, nil
 }
 
@@ -348,6 +408,9 @@ func (r *Registry) Merge(ref, fromRef string) (*Entry, error) {
 func (e *Entry) With(f func(sketch.Sketch) error) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.blocked {
+		return ErrUnavailable
+	}
 	return f(e.sk)
 }
 
@@ -355,27 +418,33 @@ func (e *Entry) With(f func(sketch.Sketch) error) error {
 func (e *Entry) Export() ([]byte, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if e.blocked {
+		return nil, ErrUnavailable
+	}
 	return e.sk.MarshalBinary()
 }
 
 // flushEntry snapshots one entry and trims the log entries it covers.
 func (r *Registry) flushEntry(ctx context.Context, e *Entry) error {
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.blocked {
+		return ErrUnavailable
+	}
 	snap, err := e.sk.MarshalBinary()
 	trim := e.logLen
 	meta := Meta{Name: e.Name, Kind: uint16(e.Kind), Batches: append([]string(nil), e.batches.order...)}
-	e.dirty = false
-	e.mu.Unlock()
 	if err == nil {
 		err = r.store.Save(ctx, e.ID, meta, snap, trim)
 	}
-	e.mu.Lock()
 	if err != nil {
-		e.dirty = true
+		// Save may have committed remotely before its response failed.  Do not
+		// permit later mutations until recovery reconciles the durable state.
+		e.blocked = true
 	} else {
 		e.logLen -= trim
+		e.dirty = false
 	}
-	e.mu.Unlock()
 	return err
 }
 
@@ -431,12 +500,14 @@ func (r *Registry) Load(ctx context.Context) (loaded, corrupt int, err error) {
 			continue
 		}
 		e := &Entry{ID: rec.ID, Name: rec.Meta.Name, Kind: sk.Kind(), sk: sk, batches: newBatchSet(rec.Meta.Batches)}
+		replayOK := true
 		for i, l := range rec.Log {
 			var w writeEntry
 			if err := json.Unmarshal(l, &w); err != nil {
 				r.log.Error("corrupt log entry", "id", rec.ID, "index", i, "err", err)
 				corrupt++
-				continue
+				replayOK = false
+				break
 			}
 			if w.BatchID != "" && e.batches.seen[w.BatchID] {
 				continue
@@ -444,10 +515,15 @@ func (r *Registry) Load(ctx context.Context) (loaded, corrupt int, err error) {
 			if _, err := apply(e.sk, w); err != nil {
 				r.log.Error("log replay failed", "id", rec.ID, "index", i, "err", err)
 				corrupt++
-				continue
+				replayOK = false
+				break
 			}
 			e.batches.add(w.BatchID)
 			e.dirty = true
+		}
+		if !replayOK {
+			r.log.Error("record unavailable after failed recovery", "id", rec.ID)
+			continue
 		}
 		e.logLen = int64(len(rec.Log))
 		r.mu.Lock()

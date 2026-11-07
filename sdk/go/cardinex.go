@@ -15,16 +15,17 @@ import (
 )
 
 type (
-	Sketch         = sketch.Sketch
-	Estimate       = sketch.Estimate
-	Semantic       = semantic.Sketch
-	SemanticParams = semantic.Params
-	Entity         = semantic.Entity
-	EntityDelta    = semantic.EntityDelta
-	Order          = semantic.Order
-	HLL            = classic.HLL
-	CMS            = classic.CMS
-	Bloom          = classic.Bloom
+	Sketch              = sketch.Sketch
+	Estimate            = sketch.Estimate
+	Semantic            = semantic.Sketch
+	SemanticParams      = semantic.Params
+	SemanticMemoryUsage = semantic.MemoryUsage
+	Entity              = semantic.Entity
+	EntityDelta         = semantic.EntityDelta
+	Order               = semantic.Order
+	HLL                 = classic.HLL
+	CMS                 = classic.CMS
+	Bloom               = classic.Bloom
 )
 
 const (
@@ -38,7 +39,7 @@ func DefaultSemanticParams(dim int, tau float64, seed uint64) SemanticParams {
 }
 
 func NewSemantic(p SemanticParams) (*Semantic, error) { return semantic.New(p) }
-func NewHLL(precision uint8) (*HLL, error)           { return classic.NewHLL(precision) }
+func NewHLL(precision uint8) (*HLL, error)            { return classic.NewHLL(precision) }
 func NewBloom(n int, fpr float64) (*Bloom, error)     { return classic.NewBloom(n, fpr) }
 func NewCMS(width, depth uint32, conservative bool) (*CMS, error) {
 	return classic.NewCMS(width, depth, conservative)

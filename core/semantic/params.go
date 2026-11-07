@@ -51,5 +51,10 @@ func (p Params) validate() error {
 	case p.Refine:
 		return ErrRefineUnsupported
 	}
+	// Keep construction and decoding within the practical limits enforced by
+	// the binary decoder.  This also bounds the encoder's sign matrices.
+	if p.Dim > maxDim || p.Capacity > maxCapacity {
+		return errors.New("semantic: dim or capacity exceeds implementation limit")
+	}
 	return nil
 }

@@ -25,6 +25,7 @@ var (
 	ErrIncompatible = sketch.ErrIncompatible
 	ErrSelfMerge    = errors.New("semantic: cannot merge a sketch into itself")
 	ErrBatchLength  = errors.New("semantic: batch slices have different lengths")
+	ErrOverflow     = errors.New("semantic: counter overflow")
 )
 
 // BatchError reports the first failing index of an AddBatch call. The sketch
@@ -64,8 +65,18 @@ type aggState struct {
 	inhSum   float64
 }
 
-func (a *aggState) ieff() uint64  { return a.inh + a.floorAdd }
-func (a *aggState) upper() uint64 { return a.g + a.ieff() }
+func (a *aggState) ieff() uint64  { return addCap(a.inh, a.floorAdd) }
+func (a *aggState) upper() uint64 { return addCap(a.g, a.ieff()) }
+
+// addCap is only used for an interval upper bound.  It never wraps: an
+// exhausted counter represents an unbounded-in-uint64 upper interval.
+func addCap(a, b uint64) uint64 {
+	if math.MaxUint64-a < b {
+		return math.MaxUint64
+	}
+	return a + b
+}
+func addOK(a, b uint64) (uint64, bool) { return a + b, math.MaxUint64-a >= b }
 
 type member struct {
 	code quant.Code
@@ -106,11 +117,21 @@ type Rejections struct {
 	Value     uint64 `json:"value"`
 }
 
-func (r *Rejections) add(o Rejections) {
-	r.Dim += o.Dim
-	r.NonFinite += o.NonFinite
-	r.ZeroNorm += o.ZeroNorm
-	r.Value += o.Value
+func (r *Rejections) add(o Rejections) error {
+	var err error
+	if r.Dim, err = addMerge(r.Dim, o.Dim); err != nil {
+		return err
+	}
+	if r.NonFinite, err = addMerge(r.NonFinite, o.NonFinite); err != nil {
+		return err
+	}
+	if r.ZeroNorm, err = addMerge(r.ZeroNorm, o.ZeroNorm); err != nil {
+		return err
+	}
+	if r.Value, err = addMerge(r.Value, o.Value); err != nil {
+		return err
+	}
+	return nil
 }
 
 // Stats is a snapshot of sketch-level state. See docs/SPEC.md §4 and §6.
@@ -139,7 +160,7 @@ var instanceSeq atomic.Uint64
 // Sketch is the semantic aggregation sketch. All methods are safe for
 // concurrent use (SPEC §8).
 type Sketch struct {
-	mu  sync.Mutex
+	mu  sync.RWMutex
 	seq uint64
 	p   Params
 	enc *quant.Encoder
@@ -171,23 +192,22 @@ func New(p Params) (*Sketch, error) {
 }
 
 // Params returns the sketch parameters.
-func (s *Sketch) Params() Params { return s.p }
+func (s *Sketch) Params() Params { s.mu.RLock(); defer s.mu.RUnlock(); return s.p }
 
 // Encoder returns the sketch's encoder, so callers can reuse its codes.
-func (s *Sketch) Encoder() *quant.Encoder { return s.enc }
+func (s *Sketch) Encoder() *quant.Encoder { s.mu.RLock(); defer s.mu.RUnlock(); return s.enc }
 
 // Add ingests one observation. It returns an error, and changes nothing but
 // the rejection counts, if the vector or value is invalid (SPEC §3.1).
 func (s *Sketch) Add(vec []float32, value float64, itemID uint64) error {
-	code, err := s.prepare(vec, value)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	code, err := s.prepare(vec, value)
 	if err != nil {
 		s.reject(err)
 		return err
 	}
-	s.ingest(code, value, itemID)
-	return nil
+	return s.ingest(code, value, itemID)
 }
 
 // AddBatch ingests observations in index order. It is all-or-nothing: every
@@ -197,21 +217,27 @@ func (s *Sketch) AddBatch(vecs [][]float32, values []float64, ids []uint64) erro
 	if len(vecs) != len(values) || len(vecs) != len(ids) {
 		return ErrBatchLength
 	}
+	// Keep one exclusive configuration/state view throughout validation,
+	// encoding and ingestion.  UnmarshalBinary therefore cannot make a batch
+	// validate with one encoder and ingest with another.
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if uint64(len(vecs)) > math.MaxUint64-s.w {
+		return &BatchError{Index: 0, Err: ErrOverflow}
+	}
 	codes := make([]quant.Code, len(vecs))
 	for i := range vecs {
 		c, err := s.prepare(vecs[i], values[i])
 		if err != nil {
-			s.mu.Lock()
 			s.reject(err)
-			s.mu.Unlock()
 			return &BatchError{Index: i, Err: err}
 		}
 		codes[i] = c
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i := range codes {
-		s.ingest(codes[i], values[i], ids[i])
+		if err := s.ingest(codes[i], values[i], ids[i]); err != nil {
+			return &BatchError{Index: i, Err: err}
+		}
 	}
 	return nil
 }
@@ -254,11 +280,17 @@ func (s *Sketch) classify(list []*counter, code quant.Code) ([]hit, bool) {
 	return hits, len(hits) == 1 && hits[0].d <= s.p.Tau-s.p.Band
 }
 
-func (s *Sketch) ingest(code quant.Code, v float64, item uint64) {
+func (s *Sketch) ingest(code quant.Code, v float64, item uint64) error {
 	hits, confident := s.classify(s.cs, code)
 	switch {
 	case confident:
 		c := hits[0].c
+		if _, ok := addOK(c.agg.g, 1); !ok {
+			return ErrOverflow
+		}
+		if _, ok := addOK(s.w, 1); !ok {
+			return ErrOverflow
+		}
 		c.agg.g++
 		c.agg.G.add(v)
 		c.id.confident++
@@ -272,15 +304,22 @@ func (s *Sketch) ingest(code quant.Code, v float64, item uint64) {
 			}
 		}
 	case len(hits) > 0:
+		if _, ok := addOK(s.wq, 1); !ok {
+			return ErrOverflow
+		}
 		for _, h := range hits[:min(2, len(hits))] {
+			if _, ok := addOK(h.c.unc.count, 1); !ok {
+				return ErrOverflow
+			}
 			h.c.unc.count++
 			h.c.unc.sum.add(v)
 		}
 		s.wq++
 		s.wqSum.add(v)
 	default:
-		s.seed(code, v, item)
+		return s.seed(code, v, item)
 	}
+	return nil
 }
 
 // ubar is Ū: max(F, min upper) when full, F otherwise.
@@ -297,7 +336,10 @@ func (s *Sketch) ubar() uint64 {
 	return max(s.floor, m)
 }
 
-func (s *Sketch) seed(code quant.Code, v float64, item uint64) {
+func (s *Sketch) seed(code quant.Code, v float64, item uint64) error {
+	if _, ok := addOK(s.w, 1); !ok {
+		return ErrOverflow
+	}
 	ub := s.ubar()
 	var inhSum float64
 	if len(s.cs) >= s.p.Capacity {
@@ -317,7 +359,7 @@ func (s *Sketch) seed(code quant.Code, v float64, item uint64) {
 	c.agg = aggState{g: 1, inh: ub, inhSum: inhSum}
 	c.agg.G.add(v)
 	c.id = idState{
-		id:          quant.Mix64(s.p.Seed ^ quant.Mix64(item) ^ quant.Mix64(s.w+0x5851f42d4c957f2d)),
+		id:          s.newEntityID(item),
 		code:        code,
 		provisional: s.p.Probation > 0,
 		confident:   1,
@@ -329,6 +371,24 @@ func (s *Sketch) seed(code quant.Code, v float64, item uint64) {
 	s.cs = append(s.cs, c)
 	s.w++
 	s.wSum.add(v)
+	return nil
+}
+
+func (s *Sketch) newEntityID(item uint64) uint64 {
+	base := s.p.Seed ^ quant.Mix64(item) ^ quant.Mix64(s.w+0x5851f42d4c957f2d)
+	for salt := uint64(0); ; salt++ {
+		id := quant.Mix64(base ^ quant.Mix64(salt))
+		found := false
+		for _, c := range s.cs {
+			if c.id.id == id {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return id
+		}
+	}
 }
 
 func (s *Sketch) exemplarPrio(item uint64) uint64 {
@@ -446,8 +506,8 @@ func (s *Sketch) dissolve(c *counter) {
 
 // Stats returns a snapshot of sketch-level state.
 func (s *Sketch) Stats() Stats {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return Stats{
 		W: s.w, WSum: s.wSum.sum, Wq: s.wq, WqSum: s.wqSum.sum, Orphaned: s.orphaned,
 		Floor: s.floor, Ubar: s.ubar(), Capacity: s.p.Capacity, Live: len(s.cs), Rejected: s.rejected,
@@ -472,8 +532,13 @@ func (c *counter) clone() *counter {
 
 // Clone returns a deep copy with a new identity for lock ordering.
 func (s *Sketch) Clone() *Sketch {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cloneLocked()
+}
+
+// cloneLocked copies state while the caller holds s.mu for reading or writing.
+func (s *Sketch) cloneLocked() *Sketch {
 	n := &Sketch{
 		seq: instanceSeq.Add(1), p: s.p, enc: s.enc,
 		floor: s.floor, w: s.w, wSum: s.wSum, wq: s.wq, wqSum: s.wqSum,

@@ -15,8 +15,8 @@ var _ sketch.Sketch = (*Sketch)(nil)
 
 // MarshalBinary encodes the sketch in the docs/FORMAT.md layout.
 func (s *Sketch) MarshalBinary() ([]byte, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	return serial.Frame(serial.KindSemantic, encodeParams(s.p), s.encodePayload()), nil
 }
 
@@ -240,9 +240,12 @@ func (s *Sketch) decodePayload(b []byte) error {
 		c.id.seedItem = r.U64()
 		c.id.seedValue = r.F64()
 		c.id.seedLive = r.Bool()
+		// Version-1 payloads had no alias bound.  Compact legacy history into
+		// the current deterministic bound instead of rejecting otherwise valid
+		// snapshots; aliases never participate in geometric matching.
 		na := r.Count(8, maxCapacity)
 		for j := 0; j < na; j++ {
-			c.id.aliases = append(c.id.aliases, r.U64())
+			c.id.aliases = appendUnique(c.id.aliases, r.U64())
 		}
 		nm := r.Count(16, s.p.Probation)
 		for j := 0; j < nm; j++ {

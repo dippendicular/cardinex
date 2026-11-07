@@ -516,6 +516,8 @@ These are smaller operations but still have defined execution behavior.
 | `DefaultSemanticParams(dim, tau, seed)` | Construct a parameter value with default capacity, band, bit width, value range, exemplar limit and probation setting. | Returns a configuration value; does not create a sketch. |
 | `Params()` | Read the sketch's stored parameter struct. | Returns configuration by value; no mutation. |
 | `Encoder()` | Return the sketch's initialized encoder reference. | The encoder is immutable after construction and can be reused for compatible codes. |
+| `MemoryBytes()` | Report an analytical estimate of retained semantic state. | Returns a deterministic byte estimate, not process RSS. |
+| `MemoryUsage()` | Break down retained semantic state by category. | Returns code, aggregate, uncertainty, alias, exemplar, probation, encoder and metadata estimates. |
 | `Kind()` | Return the semantic sketch-kind identifier. | Used by generic sketch and serialization dispatch. |
 | `TauRange(...)` | Validate geometric inputs and calculate an allowable threshold range. | Returns lower/upper threshold values or an error. Optional configuration helper, not part of ingestion. |
 | `TauFor(...)` | Call `TauRange`, then select the midpoint of its valid interval. | Returns a suggested threshold or an error. |
@@ -524,11 +526,9 @@ These are smaller operations but still have defined execution behavior.
 
 `quant.Code.Clone()` also deep-copies packed code words. `quant.Encoder.Encode()` performs validation, normalization, rotation and quantization. `quant.Encoder.Distance()` estimates angular distance between compatible compact codes. These are lower-level quantization operations, not separate semantic-summary mutations.
 
-### 14. `memory_bytes()` planned, not implemented
+### 14. Memory accounting
 
-Model v0 does **not** expose a public `memory_bytes()` method. `Stats()` reports capacity and operational counts, not analytical byte usage.
-
-A future byte-accounting operation would need to inspect the sketch configuration, packed representative codes, counter and aggregate fields, aliases, probation members, exemplar arrays, encoder state and other retained metadata. It should report an analytical state-size estimate rather than process RSS.
+`MemoryBytes()` returns the total from `MemoryUsage()`. The report is an analytical retained-state estimate: it includes packed codes, counter fields, aliases, probation, exemplars, encoder signs and metadata. It deliberately excludes Go allocator and runtime overhead, so it is not a heap/RSS measurement.
 
 Likewise, `snapshot()` is not a separate public method. Use `Clone()`.
 
@@ -581,6 +581,8 @@ Lower code precision reduces representative storage but can change estimated ang
 The repository contains a pure-Go SDK, a C ABI, and bindings for Python, C++, C#, Java, Node.js and Rust. The HTTP service exposes semantic creation, batch ingestion, lookup, top-k, per-entity diff, exemplars, stats, export/import and merge routes.
 
 The service supports `batch_id` for idempotent writes. This service-level behavior does **not** make the core `Add` API deduplicating or exactly-once. Service response tolerance handling may report `insufficient_confidence` when an estimate interval is too wide.
+
+With write logging enabled, the service applies a request to an isolated CDNX clone, appends the operation record, then publishes the prepared state. Merges persist the complete prepared receiver snapshot before publication. A store error is treated as an ambiguous remote outcome: that entry is fail-closed until restart/recovery, rather than accepting later operations against potentially divergent state. Snapshots and log trimming are serialized per entry. Redis transaction atomicity does not by itself provide disk durability; that depends on the Redis AOF, fsync, replication, and deployment configuration. The registry assumes a single service writer per sketch; it does not provide distributed writer coordination. Batch-ID retention is bounded, so it is not an unlimited exactly-once guarantee.
 
 The Go function names in this README are the authoritative names for the Go semantic engine. Other SDKs may use different naming conventions and signatures.
 

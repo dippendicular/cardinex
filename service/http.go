@@ -261,7 +261,7 @@ func (s *Server) merge(w http.ResponseWriter, r *http.Request) {
 		s.err(w, r, err)
 		return
 	}
-	e, err := s.reg.Merge(b.Into, b.From)
+	e, err := s.reg.Merge(r.Context(), b.Into, b.From)
 	if err != nil {
 		s.err(w, r, err)
 		return

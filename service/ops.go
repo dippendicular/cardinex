@@ -43,9 +43,10 @@ func statsOf(sk sketch.Sketch) any {
 	switch s := sk.(type) {
 	case *semantic.Sketch:
 		return struct {
-			Params semantic.Params `json:"params"`
+			Params semantic.Params      `json:"params"`
+			Memory semantic.MemoryUsage `json:"memory"`
 			semantic.Stats
-		}{s.Params(), s.Stats()}
+		}{s.Params(), s.MemoryUsage(), s.Stats()}
 	case *classic.HLL:
 		return map[string]any{"precision": s.Precision(), "memory_bytes": s.MemoryBytes(),
 			"relative_error": s.RelativeError(), "estimate": s.Estimate(), "interval": "probabilistic, about 95%"}

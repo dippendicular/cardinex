@@ -59,8 +59,8 @@ func orderKey(e Entity, by Order) float64 {
 // TopK returns up to k entities ranked by `by`, descending, ties to the lower
 // ID. k <= 0 returns all.
 func (s *Sketch) TopK(k int, by Order) []Entity {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	out := make([]Entity, len(s.cs))
 	for i, c := range s.cs {
 		out[i] = s.entity(c)
@@ -81,12 +81,12 @@ func (s *Sketch) TopK(k int, by Order) []Entity {
 // Lookup returns the entity Add would confidently match vec to. It returns
 // false for an ambiguous or unmatched vector, or an invalid one.
 func (s *Sketch) Lookup(vec []float32) (Entity, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	code, err := s.enc.Encode(vec)
 	if err != nil {
 		return Entity{}, false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	hits, confident := s.classify(s.cs, code)
 	if !confident {
 		return Entity{}, false
@@ -97,8 +97,8 @@ func (s *Sketch) Lookup(vec []float32) (Entity, bool) {
 // Unmonitored returns the count and sum intervals that hold for any entity
 // without a counter: [0, Ū] and [0, b·Ū].
 func (s *Sketch) Unmonitored() (count, sum Estimate) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	u := s.ubar()
 	return UnmonitoredCount(u), UnmonitoredSum(u, s.p.ValueMax)
 }
@@ -121,11 +121,11 @@ func (s *Sketch) Diff(other *Sketch) ([]EntityDelta, error) {
 	if s == other {
 		return nil, ErrSelfMerge
 	}
+	unlock := lockPair(s, other)
+	defer unlock()
 	if s.p != other.p {
 		return nil, ErrIncompatible
 	}
-	unlock := lockPair(s, other)
-	defer unlock()
 
 	a, b := s.p.ValueMin, s.p.ValueMax
 	ubA, ubB := s.ubar(), other.ubar()

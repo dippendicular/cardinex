@@ -156,7 +156,7 @@ func (m *MCP) call(ctx context.Context, name string, raw json.RawMessage) (any, 
 		if err != nil {
 			return nil, err
 		}
-		e, err := m.reg.Merge(a.Into, a.From)
+		e, err := m.reg.Merge(ctx, a.Into, a.From)
 		if err != nil {
 			return nil, err
 		}
