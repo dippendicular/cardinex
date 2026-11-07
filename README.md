@@ -1,350 +1,402 @@
 # Cardinex
 
-**Cardinex is a bounded-memory semantic streaming data structure for compact, approximate aggregation over embedding streams.** It receives embeddings from an external model and retains a bounded semantic summary: representatives, approximate count/sum/mean intervals, item-ID exemplars, and uncertainty diagnostics.
+**Cardinex is a bounded-memory semantic streaming data structure that organizes embeddings into compact semantic groups and maintains approximate frequency and aggregate information as new observations arrive.**
 
-The project investigates how geometric identity can participate directly in data-structure operations: semantic frequency aggregation, heavy-hitter discovery, distributed merging, and, eventually, distribution comparison. It is authored by Dip Chakraborty and released under the MIT License.
+Applications supply embeddings from the model of their choice. Cardinex manages the resulting streaming summary, allowing an application to work with retained semantic groups instead of storing and repeatedly processing every individual embedding.
 
-> **Research status:** this repository contains a working Go semantic sketch (model v0), C ABI, SDK bindings, HTTP/MCP service, conformance fixtures, tests, and synthetic experiment utilities. Its broader research architecture is only partly implemented. In particular, this repository does **not** implement a separate greedy-leader/Space-Saving engine, a Wasserstein-1 `diff()`, or the proposed Banking77/CLINC150 benchmark. Those are research targets, not results.
+Cardinex is useful for continuous embedding streams that need semantic grouping, approximate counts and aggregates, frequent-group discovery, snapshots, compact persistence, and compatible distributed merging.
 
-## What Cardinex is—and is not
+> **Implementation status:** the repository contains a working Go model-v0 semantic sketch, C ABI, SDK bindings, HTTP/MCP service, conformance fixtures, and tests. The public API documented below describes that implementation. Where this README uses a common conceptual name that does not exist as a method, it is explicitly labeled.
 
-Cardinex summarizes the semantic distribution of a potentially unbounded stream without retaining the original stream. Its organizing unit is a bounded set of embedding-derived representatives rather than an exact string or categorical key. It estimates per-retained-entity count, sum, and mean; exposes bounded item-ID exemplars; and reports ambiguous or unmonitored mass.
+## Overview
 
-This is a data-structure problem because update rules, state layout, capacity policy, identifiers, merge behavior, and error intervals depend on geometric identity. Similarity search alone does not maintain bounded semantic statistics, while an exact-key sketch does not recognize that different strings may inhabit a similar semantic region.
+Cardinex keeps a limited number of semantic representatives. When an embedding arrives, it is compared with those representatives. A clear match updates the associated summary; an unclear match is tracked separately; an unmatched embedding creates a representative or replaces the least-prominent retained entry when capacity is full.
 
-Cardinex is not a vector database, embedding model, SQL engine, generic clustering library, or storage system for original observations. Nearby embeddings are not proof of semantic equivalence. Online clustering plus conventional sketches remains an important alternative.
+The result is compact state that supports:
 
-## The problem
+- continuous embedding ingestion;
+- semantic grouping with configurable angular thresholds;
+- approximate count, sum, and mean intervals per retained group;
+- ranked retained groups through `TopK`;
+- bounded item-ID exemplars;
+- deep-copy snapshots through `Clone`;
+- binary export/import through the CDNX format;
+- merging compatible summaries from separate workers.
 
-In a support stream, “My payment failed,” “The transaction was declined,” and “Unable to complete checkout” may refer to a related issue while exact-key counting fragments them. Vector retrieval can find related records but does not itself maintain a bounded count, weighted aggregate, or summary of the stream’s semantic distribution.
+Cardinex does not generate embeddings, store original messages, deduplicate writes, or replace raw-data storage when exact retrieval is required.
 
-The target workload combines unbounded embedding streams, limited memory, incremental updates, approximate grouping, frequent-concept discovery, bounded nonnegative values, distributed ingestion, temporal comparison, and explicit uncertainty. The question is not only *which record is similar?* but *how much stream mass belongs to a retained semantic region, and how uncertain is that estimate?*
+## Why Cardinex?
 
-## Current implementation status
+Imagine a customer-support system receiving:
 
-| Area | Status | Evidence in this repository |
+- “My payment failed.”
+- “Transaction declined.”
+- “I cannot complete checkout.”
+
+A `HashMap` treats these as different keys. An embedding model can place similar messages near each other, but it does not maintain stream counts. A developer can assemble vector storage, similarity matching, clustering, counters, and periodic aggregation, but that leaves them responsible for coordinating state and enforcing a memory limit.
+
+Cardinex provides an integrated, compact streaming abstraction for that job.
+
+| Tool | Primary purpose | How Cardinex differs |
 | --- | --- | --- |
-| Semantic aggregation | **Implemented** | Quantized frozen representatives, ambiguity quarantine, bounded counters, count/sum/mean intervals, exemplars, merge, delta comparison, serialization, and mutex protection. |
-| Geometry | **Implemented prototype** | Seeded randomized-Hadamard rotation; 1/2/4-bit codes; estimated angular distance. |
-| Retained-key heavy hitters | **Implemented** | `TopK` ranks retained entities by count, sum, or mean. It is not certified latent-intent top-K recovery. |
-| Merge | **Implemented prototype** | Deterministic, parameter-compatible reconciliation under a fixed budget; no proof of merge-tree invariance. |
-| `Diff` | **Implemented, narrower** | Entity-aligned count/sum/mean deltas, not optimal transport. |
-| `memory_bytes()` | **Not implemented** | No public analytical state-size API. |
-| Snapshot | **Implemented as `Clone()`** | Deep copy; no method literally named `snapshot()`. |
-| Wasserstein-1 distribution difference | **Research Target** | No implementation or bound. |
-| `GreedyLeaderSS`, `LSHSpaceSaving`, `ExactOracle` benchmark | **Planned** | Existing experiments are separation, quantization, and synthetic-attack utilities. |
+| HashMap | Exact-key counting | Cardinex groups by embedding proximity rather than exact identity. |
+| Vector database | Store and retrieve vectors | Cardinex maintains compact streaming statistics; it is not a retrieval store. |
+| Clustering library | Build related groups | Cardinex focuses on incremental bounded state and aggregate maintenance. |
+| Frequency sketch | Estimate counts for predefined keys | Cardinex creates and manages embedding-derived retained keys. |
 
-Cardinex also ships independent exact-key sketches—HyperLogLog, Count-Min, and Bloom—under the CDNX binary envelope. They are separate capabilities, not the semantic engine’s identity.
+These tools can be combined with Cardinex. Cardinex does not claim that they cannot reproduce parts of this workflow.
 
-## Current engine architecture
+## How it works
 
 ```mermaid
 flowchart LR
-    I[External embedding + bounded value + item ID] --> V[Validate and normalize]
-    V --> Q[Seeded rotation and 1/2/4-bit quantization]
-    Q --> N[Linear search of retained codes]
-    N -->|one confident hit| A[Update genuine aggregate]
-    N -->|ambiguous nearby hit(s)| X[Quarantine / uncertainty ledger]
-    N -->|no nearby hit| S[Seed or replace bounded counter]
-    A --> E[Bounded exemplars]
-    S --> E
-    E --> O[TopK, lookup, intervals, merge, serialization]
+    A[Application] --> B[Embedding model]
+    B --> IN[Cardinex add]
+    subgraph ENGINE[Cardinex engine]
+        D[Representative and counter state]
+        E[Aggregate state]
+        F[Ambiguity and rejection state]
+        G[Exemplars and configuration]
+    end
+    IN --> D
+    D --> E
+    D --> F
+    D --> G
+    D --> H[Lookup]
+    D --> I[TopK]
+    D --> J[Stats / Clone / Serialize]
+    D --> K[Merge]
 ```
 
-### State representation
+### Engine lifecycle
 
-Model v0 has one `Capacity` bound, not separate geometric and frequency budgets. Every live counter combines:
+1. The application receives an observation and generates an embedding.
+2. It calls `Add` or `AddBatch` with the embedding, a bounded numeric value, and an item ID.
+3. Cardinex validates and encodes the vector, then compares it with retained representatives.
+4. A clear match updates a retained group. An ambiguous nearby match is recorded as ambiguous. An unmatched vector seeds a new entry or triggers bounded replacement.
+5. The compact state can be read with `Lookup`, `TopK`, and `Stats`, copied with `Clone`, serialized, or merged with another compatible sketch.
 
-- **Identity:** generated entity ID, quantized rotated normalized embedding code, provisional state, aliases, and probation members.
-- **Aggregation:** genuine count `g`, compensated genuine value sum `G`, inherited counter mass, inherited sum information, and merge-floor contributions.
-- **Uncertainty:** per-counter ambiguous observations/values, plus sketch-level quarantine and orphaned counts.
-- **Exemplars:** up to `Exemplars` item identifiers selected by deterministic seeded priority—not texts or complete original observations.
-- **Configuration/provenance:** dimension, capacity, angular threshold `Tau`, ambiguity half-band `Band`, quantization bits, value range, exemplar/probation settings, refinement flag, and seed.
+## Internal components
 
-The encoder normalizes input, pads to a power of two, applies seeded randomized Hadamard rotation, and quantizes it. Distance is estimated angular distance between codes; `Tau` is measured in radians. Compression and quantization are part of the retained state.
+### Representative and counter state
 
-| Implemented parameter | Meaning |
-| --- | --- |
-| `Dim` | Embedding dimension. |
-| `Capacity` | Maximum live representatives/counters. |
-| `Tau` | Angular assignment threshold. |
-| `Band` | Half-width of the ambiguity zone around `Tau`. |
-| `Bits` | 1, 2, or 4-bit quantization. |
-| `ValueMin`, `ValueMax` | Required finite, nonnegative update-value bounds. |
-| `Exemplars` | Per-counter item-ID cap. |
-| `Probation` | Member-code count for promotion checking; zero disables it. |
-| `Seed` | Rotation, ID, and exemplar-priority seed. |
+Model v0 stores a compact code for each retained representative and the aggregate/counter state associated with it. The configured `Capacity` limits the number of live entries. The implementation does **not** currently expose separate center-table and frequency-counter capacities; a single capacity bounds both.
 
-The proposed research notation deliberately separates quantities not yet independently configured: geometric budget `M`, frequency budget `K`, aliases `L`, probation `P`, exemplar capacity `R`, quantization distortion `η`, unresolved mass `U`, intrinsic doubling dimension `d₀`, latent radius `ρ`, and separation `Δ`. In model v0, `Capacity` couples much of `M` and `K`; `Probation` and `Exemplars` roughly correspond to `P` and `R`. The code does not estimate `d₀`, `ρ`, `Δ`, or a global `η` event.
+Embeddings are normalized, transformed with a seeded randomized-Hadamard rotation, and stored as 1-, 2-, or 4-bit codes. Cardinex compares those codes using estimated angular distance. The engine uses a linear scan of live representatives.
 
-## How insertion works
+### Aggregate state
 
-The conceptual future input is \((x_i,v_i,id_i,t_i)\). The implemented API is `Add(vec []float32, value float64, itemID uint64)`—there is no timestamp.
+Each retained entity tracks genuine observation count and value sum, inherited mass from replacement or merging, and enough information to return count, sum, and mean intervals. Values must fall within the configured `ValueMin` and `ValueMax` range.
 
-1. **Validate:** dimension, finite coordinates, nonzero norm, and finite in-range value are required. An invalid `Add` returns an error and increments rejection diagnostics. `AddBatch` validates all elements before mutating state.
-2. **Encode:** normalize, rotate, and quantize the embedding.
-3. **Find nearby representatives:** model v0 exhaustively searches live codes within `Tau + Band`, ordered by estimated distance and then ID.
-4. **Classify:** exactly one hit within `Tau - Band` is confident. A boundary-crossing or multi-hit observation is quarantined, not silently added to a confident aggregate. No nearby hit seeds a counter.
-5. **Respect capacity:** when full, the lowest-upper-bound counter is replaced; its inherited mass is carried in separate state and affected uncertainty can become orphaned. This is not a separate geometric-overflow policy.
-6. **Aggregate and inspect:** confident observations update genuine count/sum and may enter the bounded exemplar sample.
-7. **Probation:** provisional representatives are checked against member codes. Failure dissolves their genuine mass into uncertainty; re-anchoring can quarantine the old seed contribution.
-8. **Report:** the add call returns an error only for invalid input. Routing outcome is visible through subsequent lookup/top-k/stats rather than a structured insertion status.
+### Ambiguity, unresolved, and rejection state
 
-The distinction between inherited counter mass and genuine observations is essential. Inherited replacement mass must not be treated as actual observations when maintaining geometric identity; model v0 keeps these fields separate.
+Cardinex deliberately does not force every nearby observation into a group. A configurable `Band` around `Tau` creates an ambiguity zone. Observations near more than one representative, or in this zone, are quarantined and reported separately from confident aggregates.
 
-## Public API
+When capacity is full and a new representative is needed, the engine replaces the entry with the smallest retained upper bound. It records inherited and orphaned information so that replacement is not presented as exact deletion. Invalid vectors or values are rejected and counted in diagnostics.
 
-The Go entry point is [`sdk/go/cardinex.go`](sdk/go/cardinex.go); the C ABI is [`capi/cardinex.h`](capi/cardinex.h). HTTP and MCP expose corresponding operations.
+### Exemplars
 
-| Conceptual operation | Current operation | Status and semantics |
-| --- | --- | --- |
-| `create(config)` | `semantic.New(params)` / `NewSemantic(params)` | **Implemented.** Validates parameters and initializes the encoder/state. Parameter equality is compatibility validation. |
-| `add(embedding, value, item_id, timestamp)` | `Add`; `AddBatch` | **Implemented, different signature.** Timestamp unsupported. |
-| `match(embedding)` | Internal classification | **Not public.** `Lookup` returns only a confident accepted match—not nearest candidate/distance. |
-| `query(embedding)` | `Lookup(vec)` | **Implemented, narrower.** Returns the entity a new vector would confidently match, or `false`; no neighborhood aggregation. |
-| `topk(k)` | `TopK(k, ByCount|BySum|ByMean)` | **Implemented.** Count/sum use interval upper-bound ranking; mean uses point mean; ties use lower ID. |
-| `merge(other)` | `Merge(sketch.Sketch)` | **Implemented prototype.** Requires exact parameter equality; source remains unchanged. |
-| `diff(previous, current)` | `Diff(other)` | **Implemented, different meaning.** Returns entity-aligned count/sum/mean deltas; no Wasserstein computation. |
-| `exemplars(group_id)` | Entity `Exemplars`; service endpoint | **Implemented.** Bounded IDs only. |
-| `stats()` | `Stats()` | **Implemented.** Aggregates and diagnostics. |
-| `memory_bytes()` | — | **Not implemented.** |
-| `snapshot()` | `Clone()` | **Implemented under another name.** Deep copy while locked. |
-| `serialize()` / `deserialize()` | `MarshalBinary`, `Unmarshal`, `UnmarshalBinary` | **Implemented.** Versioned little-endian CDNX framing with CRC-32C. |
+Each entity can retain up to `Exemplars` item IDs, chosen with a deterministic seeded priority. These IDs let an application retrieve examples from its own data store. Cardinex does not retain full original observations.
 
-`Lookup` is stricter than nearest neighbor: invalid, unmatched, and ambiguous vectors yield no entity. `TopK` concerns retained semantic keys, not verified latent entities. No arbitrary deletion, exact membership, exact nearest-neighbor retrieval, `contains()`, or `neighbors()` API is currently promised.
+### Configuration and metadata
 
-## Uncertainty and justified claims
+The semantic parameters include `Dim`, `Capacity`, `Tau`, `Band`, `Bits`, `ValueMin`, `ValueMax`, `Exemplars`, `Probation`, `Refine`, and `Seed`. Compatible configuration matters because independent sketches must encode and compare vectors in the same way before they can merge.
 
-For a retained counter, the implementation exposes intervals from genuine mass and inherited/merge mass. With genuine count `g` and effective inherited count `I_eff`, count is `[g, g + I_eff]`; sum and mean use the configured value range. Attached ambiguous mass is returned separately and never folded into confident aggregate values. `Unmonitored()` returns `[0, Ū]` for a missing counter’s count and `[0, ValueMax × Ū]` for sum.
+`Refine` is present in the parameter type but unsupported in model v0. `Stats` reports live usage, confident and quarantined mass, orphaned mass, rejection counts, and promotion/merge diagnostics.
 
-The source documents these intervals as guaranteed **conditional on an `η` event** and a separation condition. Parameter helpers use
+## Getting started
 
-\[
-\Delta > 4\rho + 4\eta + 2\,\mathrm{Band}.
-\]
-
-The repository does not estimate those quantities in a production stream or provide a complete proof that embedding semantics meet the condition. Treat this as a conditional model-v0 claim, not empirical validation of intent labels.
-
-| Claim | Status |
-| --- | --- |
-| Validation, capacity enforcement, deterministic tie-breaking, batch atomicity, serialization validation, mutex protection | **Established implementation behavior.** |
-| Angular distance as a metric on normalized raw vectors | **Established mathematical fact.** Ordinary `1 − cosine similarity` is generally not a metric. |
-| Interval formulas under bounded values and the stated event/geometry assumptions | **Conditional model claim.** |
-| Latent semantic heavy-hitter recovery, merge-tree-independent error, or superiority over baselines | **Unproven Cardinex-specific claim.** |
-| Wasserstein-1 drift interval over compressed summaries | **Open / Research Target.** |
-
-## Geometric identity and fragmentation
-
-A proposed greedy-leader design would seek separation \(d(c_i,c_j)>\tau\) and coverage \(\min_c d(x,c)\le\tau\). An arbitrary unbounded stream under a strict fixed budget cannot necessarily have both. A future design must state its overflow policy explicitly: unresolved mass, bounded admission/eviction, or a different representation.
-
-Model v0 has a related but different policy: ambiguity quarantine around a threshold and replacement at shared capacity. One latent entity may fragment across representatives, causing undercount when inspecting one center. Blindly summing nearby centers can instead create false merges and overcount. Proposed stable semantic keys or split-center aggregation might reduce fragmentation, but introduce identity-mapping false-split and false-merge error; they are not implemented solutions.
-
-## Distributed merging
-
-`Merge` only accepts semantic sketches with exactly equal parameters. It locks summaries in deterministic sequence order, processes source counters by ID, fuses confident matches, aliases ambiguous neighbors, adds floors for unseen mass, trims deterministically to `Capacity`, carries diagnostics, and performs deferred promotion checks. It is deterministic for a given pair and state, but lossy; it must not be assumed associative or merge-tree invariant.
-
-```mermaid
-flowchart LR
-    A[Summary A] --> C[Validate identical configuration]
-    B[Summary B] --> C
-    C --> R[Reconcile representatives]
-    R --> F[Fuse confident / alias ambiguous]
-    F --> U[Propagate floors and uncertainty]
-    U --> T[Trim to capacity]
-    T --> M[Merged model-v0 summary]
-```
-
-For a proposed operator \(S_{AB}=S_A\oplus S_B\), if original assignment radius is `r₀` and a merge level displaces representatives by at most `q_ℓ`, triangle inequality gives
-
-\[
-R_h \le r_0 + \sum_{\ell=1}^{h}q_\ell.
-\]
-
-If a separately proven policy has \(q_\ell\le\lambda\tau\), then \(R_h\le r_0+h\lambda\tau\). The code establishes neither universal `λ` nor an unconditional \((h+1)\tau\) bound, and it does not establish combined counter uncertainty over arbitrary merge trees.
-
-## Distribution difference
-
-Current `semantic.Diff` aligns retained entities under the matching rule and returns interval deltas for count, sum, and mean. It is useful for entity deltas but is **not** optimal transport, a semantic-distribution metric, or performance-regression detection.
-
-The proposed first-class `diff()` would validate embedding-space/metric provenance, normalize weighted representative distributions, represent unresolved mass validly, estimate Wasserstein-1 distance, and return an interval combining geometry, mass, and solver error. Residual mass may make that interval inconclusive; localized residual buckets trade memory for a multi-resolution representation. This remains a **Research Target**.
-
-## Research contributions under investigation
-
-The central question is: **can bounded memory combine approximate geometric identity, semantic frequency estimation, distributed merging, and temporal distribution comparison with explicit end-to-end error guarantees?**
-
-1. **Geometry-aware semantic heavy hitters:** account separately for identity/geometry error, counter approximation, fragmentation, and unresolved mass.
-2. **Error-controlled reconciliation:** merge independently built summaries while tracking displacement and frequency uncertainty.
-3. **Formal semantic distribution difference:** make compressed distribution comparison, potentially Wasserstein-1, a first-class operation with a valid interval.
-4. **Operating-regime identification:** find where a geometric approach helps under equal analytical memory, and where it does not.
-
-These are research questions, not claims of universal novelty or superiority.
-
-## Prior work and positioning
-
-Space-Saving and other frequent-item summaries, incremental clustering and greedy covers, mergeable summaries, locality-sensitive hashing, streaming micro-clusters, near-duplicate streaming statistics, and optimal transport all provide relevant foundations. Cardinex’s question is whether their combination can be useful and analyzable.
-
-- Metwally, Agrawal, and El Abbadi’s Space-Saving method is a natural bounded frequency baseline.
-- Charikar, Chen, and Farach-Colton’s frequent-items work represents exact-key stream-frequency foundations.
-- Agarwal et al. formalize mergeable summaries, including deterministic mergeable heavy hitters; independently constructed geometric identities add a distinct reconciliation problem.
-- Indyk and Motwani’s LSH offers a fixed-key alternative that may simplify merge while retaining collisions and fragmentation.
-- CluStream and DenStream are relevant streaming-clustering families, but optimize a different objective.
-- Qin Zhang’s 2025 near-duplicate work is especially relevant: it studies distinct elements and \(\ell_0\)-sampling in general metric-space streams. A frequency/heavy-hitter extension must be examined before claiming Cardinex novelty for semantic heavy hitters.
-
-## Architecture alternatives
-
-| Candidate | Idea | Open tradeoff |
-| --- | --- | --- |
-| **Plan A: adaptive latent-center sketch** | Geometric representatives and semantic assignment. | Strong grouping potential; difficult identity, fragmentation, and merge guarantees. |
-| **Plan B: hierarchical/multi-resolution quantizer** | Deterministic cells and localized residual mass. | May simplify reconciliation; may overlap with existing summaries/quantization. |
-| **Plan C: LSH semantic sketch** | Fixed LSH keys followed by frequency state. | Easier distributed keys; collisions and fragmentation persist. |
-
-The existing model v0 is a prototype, not permanent selection of Plan A. If experiments fail to show meaningful equal-memory advantage, Plan C and bounded distribution difference should be investigated independently.
-
-## Developer examples
-
-### Working Go API
+### Go
 
 ```go
 import (
     "fmt"
+
     cardinex "github.com/dippendicular/cardinex/sdk/go"
     "github.com/dippendicular/cardinex/core/semantic"
 )
 
 p := cardinex.DefaultSemanticParams(384, 0.6, 1)
 p.Capacity = 4096
-s, err := cardinex.NewSemantic(p)
-if err != nil { panic(err) }
 
-if err := s.Add(embedding, 0.7, itemID); err != nil { panic(err) }
-if entity, ok := s.Lookup(embedding); ok {
+summary, err := cardinex.NewSemantic(p)
+if err != nil {
+    panic(err)
+}
+
+if err := summary.Add(embedding, 1.0, itemID); err != nil {
+    panic(err)
+}
+
+if entity, ok := summary.Lookup(embedding); ok {
     fmt.Println(entity.ID, entity.Count.Lower, entity.Count.Upper)
 }
-for _, entity := range s.TopK(10, cardinex.ByCount) {
-    fmt.Println(entity.ID, entity.Count, entity.Ambiguous)
-}
-fmt.Println(s.Stats())
 
-snapshot := s.Clone()
-wire, err := snapshot.MarshalBinary()
-if err != nil { panic(err) }
-restored, err := semantic.Unmarshal(wire)
-if err != nil { panic(err) }
+for _, entity := range summary.TopK(10, cardinex.ByCount) {
+    fmt.Println(entity.ID, entity.Count, entity.Exemplars)
+}
+
+snapshot := summary.Clone()
+data, err := snapshot.MarshalBinary()
+if err != nil {
+    panic(err)
+}
+restored, err := semantic.Unmarshal(data)
+if err != nil {
+    panic(err)
+}
 _ = restored
 ```
 
-`AddBatch` validates aligned vector/value/ID slices atomically. Python provides `Semantic.add_batch`; the C ABI accepts zero-copy row-major float32 batches. An external embedding model supplies vectors—Cardinex does not require a vector database for aggregation.
-
-### Working Python API
+### Python
 
 ```python
 import numpy as np
 import cardinex
 
 with cardinex.Semantic(dim=384, tau=0.6, seed=1) as summary:
-    summary.add_batch(
-        embeddings.astype(np.float32),
-        values=losses,
-    )
+    summary.add_batch(embeddings.astype(np.float32), values=losses)
     print(summary.topk(10, by="mean"))
 ```
 
-### Merge and delta comparison
+The Python binding uses the C ABI. The C ABI also supports zero-copy, row-major float32 batch input.
+
+## Core API
+
+### Creating a summary
+
+**Implemented:** `semantic.New(params)` and `cardinex.NewSemantic(params)` create an empty semantic summary.
+
+Creation validates the embedding dimension, capacity, threshold/band relationship, quantization width, value bounds, exemplar/probation limits, and unsupported refinement flag. It then initializes the encoder and empty state.
+
+Use identical parameters for summaries that will be merged. The current implementation treats parameter equality as compatibility; it has no separate embedding-model-name field, so applications should enforce model provenance themselves.
+
+### Adding observations
+
+**Implemented:**
 
 ```go
-left, _ := cardinex.NewSemantic(p)
-right, _ := cardinex.NewSemantic(p)
-// Ingest compatible partitioned streams.
-if err := left.Merge(right); err != nil { panic(err) }
-
-// Per-entity count/sum/mean deltas; this is not Wasserstein-1.
-deltas, err := left.Diff(right)
-if err != nil { panic(err) }
-_ = deltas
+err := summary.Add(embedding []float32, value float64, itemID uint64)
+err := summary.AddBatch(vectors [][]float32, values []float64, itemIDs []uint64)
 ```
 
-### Illustrative future API—not executable
+`Add` performs this flow:
 
-```text
-summary = create(config with M, K, tau, provenance)
-status  = summary.add(embedding, value, item_id, timestamp)
-w1      = diff(previous_snapshot, summary.snapshot())
+1. Validates vector length, finite coordinates, nonzero norm, and value bounds.
+2. Encodes the normalized vector into a compact code.
+3. Finds retained representatives within the matching area.
+4. Makes one of three decisions:
+   - exactly one clear match: update that entity;
+   - one or more ambiguous nearby matches: record ambiguous mass and do not add it to a confident entity;
+   - no nearby match: seed an entity, replacing the lowest-upper-bound entry if capacity is full.
+5. Updates genuine count/sum, bounded exemplars, and operational diagnostics for confident observations.
+6. Runs the configured probation check when needed.
+
+```mermaid
+flowchart TD
+    A[Incoming embedding] --> B[Validate and encode]
+    B --> C{Clear retained match?}
+    C -->|Yes| D[Update entity aggregate and exemplars]
+    C -->|No, ambiguous nearby match| E[Record ambiguous state]
+    C -->|No nearby match| F{Capacity available?}
+    F -->|Yes| G[Seed new entity]
+    F -->|No| H[Replace lowest-bound entry and seed]
+    D --> I[Updated compact summary]
+    E --> I
+    G --> I
+    H --> I
 ```
 
-Current code has no timestamp, separate `M`/`K`, structured add status, `memory_bytes()`, or Wasserstein `diff()`.
+An `Add` call returns an error for invalid input. It does not return a structured assignment status. `AddBatch` is all-or-nothing: it validates every item first, returns the first failing index in `BatchError`, and does not apply a partially invalid batch.
 
-## Research validation and benchmark plan
+Inserting the same observation twice processes it twice. Cardinex has no automatic deduplication or exactly-once guarantee. Counter replacement does not mean that an unrelated geometric record has been silently accepted as the replacement: inherited counter mass is tracked separately from genuine observations, and the new representative is seeded from the new vector.
 
-This is a **frozen proposed protocol v0.1**, not a completed experiment. Implement `GreedyLeaderSS`, `LSHSpaceSaving`, and `ExactOracle` with `add()`, `query()`, `topk()`, `memory_bytes()`, `snapshot()`, and `merge()`; early `merge()` may raise `NotImplementedError`.
+### Querying semantic groups
 
-Use Banking77 and CLINC150, at least two embedding-model families with different dimensions, 20 deterministic random permutations, and one class-sorted adversarial order. Report mean, standard deviation, and every dataset–embedding cell. Tune leader radius and LSH bits/tables with equal validation budgets, then evaluate selected settings on held-out test data.
+**Implemented name:** `Lookup`, not `query`.
 
-Memory comparison must be analytical: centers require \(M\times d\times\text{bytes/value}\); Space-Saving requires keys/counts/errors/metadata; LSH projections require \(L\times b\times d\times\text{bytes/value}\), plus buckets and counters. Evaluate float32, float16, and int8 where appropriate; account for quantization metadata and distortion; distinguish per-sketch from shared amortized state.
+```go
+entity, found := summary.Lookup(embedding []float32)
+```
 
-Report native-key error, fragmentation, key purity, intent-level top-K recall, intent-level frequency error, signed and absolute error, memory, and stream-order sensitivity. Use the same validation-only majority-label-per-key mapping for both algorithms; never use test labels to construct it. Report mapping memory separately. Intent labels are an imperfect semantic ground truth; PAWS, QQP, or curated paraphrase groups are possible later complements.
+`Lookup` validates and encodes the input, searches retained representatives, and returns an entity only when there is exactly one clear match. The result includes its ID, count/sum/mean intervals, ambiguity attached to that entity, exemplar IDs, provisional state, and aliases.
 
-The geometric direction continues only if at least three of four dataset–embedding cells show at least 20% relative intent-level frequency-error reduction at three or more memory budgets; the remaining cell avoids over-10% regression at four or more budgets; winners beat the baseline in 16/20 permutations; class-sorted streams avoid over-10% regression; and native counting/fragmentation/purity diagnostics explain the result. The 20% threshold is an engineering-materiality decision, not a theorem; permutation intervals describe order sensitivity, not population generalization. A later substantially larger real-world stream, potentially Amazon Reviews, remains necessary.
+`found == false` means the vector is invalid, unmatched, or ambiguous. It does not mean that a related concept has never appeared: it might be quarantined, fragmented across retained entities, or no longer explicitly monitored after replacement. `Lookup` does not return the merely nearest representative or a matching distance.
 
-The checked-in `experiments/` tools support separation, quantization, and synthetic adversarial studies; they do not yet implement this benchmark or supply performance evidence.
+For a payment-related complaint, generate an embedding with the same model/configuration used for ingestion, then call `Lookup`. If it returns an entity, inspect `entity.Count`, `entity.Sum`, `entity.Mean`, and `entity.Exemplars`. If it does not, call `Unmonitored()` to read the sketch-wide bound for an unretained entity.
 
-## Applications
+### Finding frequent semantic groups
 
-| Application | Input and operations | Useful output | Cannot guarantee |
-| --- | --- | --- | --- |
-| Customer feedback | Feedback embeddings and bounded sentiment/severity; add/top-k/lookup. | Frequent retained complaint regions and uncertain aggregates. | Ground-truth intent or full retrieval. |
-| LLM evaluation | Embedded failure descriptions with bounded losses. | Recurring error regions and score intervals. | Performance regression from drift alone. |
-| Training-data curation | Embeddings and bounded quality signals. | Repetitive regions and aggregate signals. | Full deduplication or quality certification. |
-| Agent observability | Embedded observations/tool failures and bounded cost. | Recurrent patterns and possible loops. | Causal diagnosis or complete traces. |
-| Distributed events | Compatible worker-local summaries and merge. | Compact merged aggregate and diagnostics. | Exact associativity or merge-order-independent geometry. |
+**Implemented:**
 
-## Complexity, memory, and limitations
+```go
+groups := summary.TopK(10, cardinex.ByCount)
+// Other ranking modes: cardinex.BySum and cardinex.ByMean.
+```
 
-The current index is linear. Encoding performs rotation/quantization; classification is `O(C × q)` for `C ≤ Capacity` and compact-code comparison cost `q`, proportional to padded dimension/word count. `TopK` sorts `C` entities: `O(C log C)`. Merge reconciles incoming representatives against retained state and is not constant-time. These are asymptotic descriptions, not measured throughput claims.
+`TopK` reads live entities, derives their public aggregate views, sorts by the requested metric, and applies deterministic ID tie-breaking. Count and sum ranking use interval upper bounds; mean ranking uses the exposed mean value. `k <= 0` returns every retained entity.
 
-Memory includes compact codes, aggregation fields, IDs, aliases, probation members, exemplars, and container overhead. There is no current analytical `memory_bytes()` function; process RSS is not an appropriate substitute. A future engine must count all state, including vectors, counters, identifiers, errors, quantization metadata, residuals, and indexes. Approximate nearest-neighbor indexing may improve speed but adds assignment error and state.
+The output ranks retained IDs, not perfectly reconstructed real-world concepts. One concept can occupy several centers, which splits its apparent frequency. Model v0 preserves aliases created during merge but does not provide general group reconciliation.
 
-Important open limitations include:
+Illustrative output:
 
-- semantic similarity is not an equivalence relation; embedding-model changes can break comparability;
-- fixed capacity cannot cover arbitrary streams; saturation, replacement, fragmentation, and quarantine are material;
-- separation and intrinsic-dimension assumptions may fail or be vacuous in real embeddings;
-- merge depth/reconciliation order may change distortion, and complete combined counter-error guarantees are open;
-- residual mass can make future Wasserstein bounds too wide to support a decision;
-- equal-memory superiority over online clustering, LSH, or exact-key sketches is unverified.
+| Rank | Representative ID | Count interval | Example IDs |
+| --- | ---: | ---: | --- |
+| 1 | 8012 | 412–435 | `104`, `220`, `841` |
+| 2 | 1297 | 201–219 | `502`, `878` |
 
-## Repository layout and building
+The values above are examples, not benchmark results.
+
+### Understanding memory usage
+
+**Planned name:** `memory_bytes()` is not implemented in model v0.
+
+The current engine is bounded by `Capacity`, but it does not expose a public analytical byte count. The maintained state includes compact representative codes, aggregate/counter fields, entity IDs, aliases, probation members, exemplar IDs, configuration, and Go container overhead. Precision (`Bits`) and padded embedding dimension affect code size.
+
+Do not substitute process RSS for analytical state size: RSS includes the runtime, allocator, and unrelated application state. A future `memory_bytes()` API should report every maintained structure. It should also count any added indexes or projection state.
+
+Model v0 has one shared capacity rather than separately tunable center and counter capacities. Developers can currently tune `Capacity`, `Bits`, `Exemplars`, and `Probation`; lower capacity or smaller codes reduce retained state at the cost of representation detail.
+
+### Creating snapshots
+
+**Implemented name:** `Clone`, not `snapshot`.
+
+```go
+snapshot := summary.Clone()
+```
+
+`Clone` locks the live sketch, deep-copies its representative, aggregate, uncertainty, exemplar, configuration, and diagnostic state, then returns an independent summary. Later writes to the live summary do not change the clone.
+
+Use a clone for hourly reports, persistence staging, exports, or comparing application-level snapshots. `MarshalBinary` serializes a summary into CDNX bytes; `semantic.Unmarshal` restores those bytes. A clone is a stable in-memory logical state, while serialization is the portable representation of that state.
+
+The implementation protects sketch methods with a mutex, including `Clone`, but it does not expose a multi-sketch transaction or a globally coordinated snapshot.
+
+### Merging distributed summaries
+
+**Implemented:**
+
+```go
+err := workerA.Merge(workerB)
+```
+
+`Merge` modifies the receiver and leaves the source summary unchanged. It requires both values to be semantic sketches with exactly equal parameters. The engine:
+
+1. validates compatibility and avoids self-merge;
+2. reads retained entries in deterministic ID order;
+3. fuses clear compatible matches;
+4. records aliases for ambiguous nearby representatives;
+5. carries counter/aggregate uncertainty rather than treating estimates as exact observations;
+6. applies floors for mass that is not explicitly represented on one side;
+7. trims to `Capacity` and records dropped/orphaned information;
+8. runs deferred probation checks.
+
+The merged summary is compact and deterministic for the same pair of states. Because reconciliation and capacity trimming are lossy, applications should not expect every merge order to create identical semantic groupings.
+
+## Distributed processing
+
+Each worker ingests raw observations locally. Only compact summaries need to cross the network for merging.
+
+```mermaid
+flowchart LR
+    RA[Raw events A] --> WA[Worker A\nLocal Cardinex]
+    RB[Raw events B] --> WB[Worker B\nLocal Cardinex]
+    RC[Raw events C] --> WC[Worker C\nLocal Cardinex]
+    WA --> M[Merge engine]
+    WB --> M
+    WC --> M
+    M --> CS[Combined Cardinex]
+```
+
+Use the same model, dimension, thresholds, quantization settings, value range, seed, and remaining semantic parameters on every worker. If configurations differ, `Merge` returns an incompatibility error. If an application changes embedding models, begin a separate summary rather than merging incompatible vector spaces.
+
+## Complete developer journey
+
+This example uses customer-support analytics.
+
+1. **Choose an embedding model.** Select a model and keep its dimension and preprocessing consistent for the lifetime of a summary.
+2. **Create Cardinex.** Set `Dim`, `Tau`, `Capacity`, value range, and compression/exemplar settings with `DefaultSemanticParams` or `semantic.Params`.
+3. **Ingest messages.** Persist the original message in application storage, generate its embedding, and call `Add(embedding, severity, itemID)`.
+4. **Query an issue.** Embed “payment rejected at checkout” with the same model and call `Lookup`. A confident match returns its aggregate interval and exemplar IDs.
+5. **Find frequent issues.** Call `TopK(10, ByCount)` to populate an approximate issue dashboard.
+6. **Inspect state.** Call `Stats` to check live capacity, quarantined observations, replacement-related orphaned mass, and input rejections. A byte-level memory method is not yet available.
+7. **Capture a reporting point.** Call `Clone` hourly and serialize the clone if it must leave the process.
+8. **Scale out.** Run compatible summaries per worker, then merge into an aggregation summary when partitions complete.
+9. **Display results.** Show count/sum/mean intervals and indicate ambiguity rather than presenting estimates as exact counts.
+
+Conceptual APIs sometimes call steps 6 and 7 `memory_bytes()` and `snapshot()`. In this repository, use `Stats()` and `Clone()` respectively.
+
+## Service and SDK integration
+
+The C ABI in [`capi/cardinex.h`](capi/cardinex.h) exposes creation, semantic add/add-batch, top-k, lookup, diff, merge, stats, marshal, and unmarshal. SDK directories provide Go, Python, C++, C#, Java, Node.js, and Rust bindings.
+
+The HTTP service exposes semantic creation, batch add, top-k, lookup, entity-delta diff, exemplars, stats, export/import, and merge routes. Service writes use `batch_id` for idempotency. With a requested tolerance, answers whose interval is wider than that value receive `insufficient_confidence`.
+
+`Diff` is implemented as per-entity count/sum/mean delta comparison between compatible summaries. It is separate from `Merge` and should not be treated as a general semantic-distance or raw-data comparison API.
+
+## Practical use cases
+
+| Use case | Input and Cardinex operations | Expected output |
+| --- | --- | --- |
+| Customer feedback analytics | Message embeddings plus severity/sentiment values; `Add`, `Lookup`, `TopK`. | Retained complaint groups, approximate counts, aggregate intervals, example IDs. |
+| LLM evaluation | Embeddings of failure descriptions plus bounded score/loss. | Repeated error-pattern summaries and aggregate score information. |
+| Agentic AI monitoring | Embedded agent observations and tool failures; `Add`, `Stats`, `TopK`. | Recurring behavior or failure candidates with bounded summary state. |
+| Training-data analytics | Embeddings and bounded quality signals. | Repetitive retained regions and lightweight aggregate summaries. |
+| Distributed event processing | Per-worker summaries followed by compatible `Merge`. | Compact combined state without replaying raw events. |
+
+## Configuration and memory management
+
+`DefaultSemanticParams(dim, tau, seed)` supplies defaults. Customize fields before construction:
+
+- `Capacity` controls the maximum number of live entries.
+- `Tau` controls how close a clear match must be.
+- `Band` reserves uncertainty around the threshold; larger bands report more ambiguous observations instead of forcing assignments.
+- `Bits` selects compact-code precision: 1, 2, or 4.
+- `ValueMin` and `ValueMax` must cover every supplied value.
+- `Exemplars` limits retained item IDs per entity.
+- `Probation` controls how provisional representatives are checked; zero disables it.
+- `Seed` must match across sketches that need to merge.
+
+Tune capacity and compression against the quality your application needs. Watch `Stats().Live`, `Stats().Wq`, `Stats().Orphaned`, and rejection counters; they reveal saturation, ambiguity, replacement effects, and bad inputs.
+
+## Limitations
+
+- Statistics are approximate and include intervals or ambiguity metadata.
+- Similar embeddings are not necessarily the same real-world concept.
+- A concept can fragment across multiple retained entities.
+- Capacity saturation causes replacement and can reduce representation quality.
+- Model v0 has one shared capacity, not separate center/counter budgets.
+- `Lookup` returns only clear matches; it does not provide arbitrary nearest-neighbor retrieval.
+- Merging requires exact configuration compatibility and may be sensitive to merge order.
+- Changing embedding models or preprocessing invalidates direct comparison and merging.
+- Cardinex retains item IDs, not raw data; use your own storage for exact retrieval.
+
+## Roadmap
+
+Possible future work includes a public analytical `memory_bytes()` method, a named snapshot API, separate geometric and frequency budgets, richer semantic-group reconciliation, and additional distribution-comparison operations. These are not available features in model v0.
+
+## Repository layout and installation
 
 | Path | Contents |
 | --- | --- |
-| `core/semantic` | Model-v0 semantic sketch, estimators, query, merge, serialization. |
-| `core/quant` | Rotation and compact codes. |
-| `core/classic` | HyperLogLog, Count-Min, Bloom. |
-| `core/serial` | CDNX binary framing. |
-| `capi`, `sdk` | C ABI and Go/Python/C++/C#/Java/Node/Rust bindings. |
-| `service` | HTTP API, MCP server, registry, optional Redis persistence. |
-| `conformance`, `bench`, `experiments` | Fixtures, microbenchmarks, research tools. |
+| `core/semantic` | Semantic sketch, aggregation, query, merge, and serialization. |
+| `core/quant` | Embedding rotation and compact encoding. |
+| `core/classic` | HyperLogLog, Count-Min, and Bloom sketches. |
+| `capi` | C ABI. |
+| `sdk` | Language bindings. |
+| `service` | HTTP and MCP services. |
+| `conformance`, `bench`, `experiments` | Fixtures, benchmarks, and utilities. |
 
 ```sh
-make build        # Go packages
-make test         # Go tests
-make lib          # native shared library (C compiler required)
-make conformance  # Go + Python conformance path
-make cross        # cross builds with zig cc
+make build        # Build Go packages
+make test         # Run Go tests
+make lib          # Build the native library (C compiler required)
+make conformance  # Run Go + Python conformance path
+make cross        # Cross-build with zig cc
 docker compose up --build
 ```
 
-The service supplies semantic create/add-batch/top-k/lookup/entity-delta-diff/exemplars/stats/export/import/merge routes plus classic-sketch routes. `batch_id` makes service writes idempotent. With a tolerance, intervals wider than the threshold return `insufficient_confidence`. Environment variables: `ADDR`, `REDIS_ADDR`, `FLUSH_INTERVAL` (default `5s`), `LOG_WRITES` (default `1`), and `CARDINEX_API_KEY`.
+Service configuration: `ADDR`, `REDIS_ADDR`, `FLUSH_INTERVAL` (default `5s`), `LOG_WRITES` (default `1`), and `CARDINEX_API_KEY`.
 
-## References
+## License and contributing
 
-1. Ahmed Metwally, Divyakant Agrawal, and Amr El Abbadi. *Efficient Computation of Frequent and Top-k Elements in Data Streams.* ICDT, 2005.
-2. Moses Charikar, Kevin Chen, and Martin Farach-Colton. *Finding Frequent Items in Data Streams.* ICALP, 2002; *Theoretical Computer Science* 312(1), 2004.
-3. Pankaj K. Agarwal et al. [*Mergeable Summaries*](https://www.cs.ox.ac.uk/people/graham.cormode/pubs/html/AgarwalCormodeHuangPhillipsWeiYi12.html). PODS, 2012.
-4. Piotr Indyk and Rajeev Motwani. *Approximate Nearest Neighbors: Towards Removing the Curse of Dimensionality.* STOC, 1998.
-5. Charu C. Aggarwal et al. *A Framework for Clustering Evolving Data Streams.* VLDB, 2003. (CluStream.)
-6. Fabrizio Cao et al. *Density-Based Clustering over an Evolving Data Stream with Noise.* SDM, 2006. (DenStream.)
-7. Qin Zhang. [*Robust Statistical Analysis on Streaming Data with Near-Duplicates in General Metric Spaces*](https://homes.luddy.indiana.edu/qzhangcs/papers/pods25-GenRobustDE.pdf). *Proceedings of the ACM on Management of Data*, 2025. It studies near-duplicate-aware distinct elements and \(\ell_0\)-sampling, not Cardinex heavy hitters.
-
-## License and contributions
-
-Cardinex is licensed under the [MIT License](LICENSE). Contributions should clearly distinguish implemented behavior, conditional analysis, proposed design, and empirical evidence. Claims about guarantees or comparative performance should include a proof, a reproducible experiment, or both.
+Cardinex is available under the [MIT License](LICENSE). Contributions should preserve API accuracy, document compatibility requirements, and keep planned features clearly separate from implemented behavior.
