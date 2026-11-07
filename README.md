@@ -9,7 +9,7 @@ Cardinex does not generate embeddings, retain raw messages, perform automatic ev
 ## Contents
 
 - [Why Cardinex](#why-cardinex)
-- [End-to-end architecture](#end-to-end-architecture)
+- [Architecture](#architecture)
 - [What the engine stores](#what-the-engine-stores)
 - [Quick start](#quick-start)
 - [API execution flows](#api-execution-flows)
@@ -54,35 +54,13 @@ Cardinex gives the application one stateful interface for semantic assignment, b
 | Frequency sketch | Approximate counts for existing keys. |
 | **Cardinex** | Create retained embedding-derived entities and maintain compact streaming statistics about them. |
 
-## End-to-end architecture
+## Architecture
 
-```mermaid
-flowchart LR
-    APP[Application events] --> MODEL[External embedding model]
-    MODEL --> ADD[Add / AddBatch]
-    ADD --> VALID[Validate and encode]
-    VALID --> CLASS[Classify against retained representatives]
-
-    subgraph CORE[Cardinex summary]
-        REP[Representative codes and IDs]
-        AGG[Genuine and inherited aggregate state]
-        UNC[Ambiguity, floor and orphaned state]
-        EX[Bounded exemplar IDs]
-        CFG[Configuration and diagnostics]
-    end
-
-    CLASS --> REP
-    CLASS --> AGG
-    CLASS --> UNC
-    CLASS --> EX
-    CLASS --> CFG
-
-    CORE --> READ[Lookup / TopK / Unmonitored / Stats]
-    CORE --> COPY[Clone / MarshalBinary]
-    CORE --> DIST[Merge / Diff]
-```
+<img width="1774" height="887" alt="Architecture Tree" src="https://github.com/user-attachments/assets/17d039ed-32ba-4ff8-a853-f8f6b6cef3f1" />
 
 The engine processes vectors, not raw text. The embedding model must remain consistent across ingestion, lookup, and summaries intended for merging. Model v0 does not store an embedding-model identifier, so the application must enforce that compatibility.
+
+<img width="1774" height="887" alt="Core Architecture" src="https://github.com/user-attachments/assets/f2b9169b-695b-4515-816c-3669849ce2b6" />
 
 ## What the engine stores
 
@@ -209,14 +187,8 @@ summary, err := cardinex.NewSemantic(params)
 
 The sketch has no live entities, no observations, and zero operational counters. Its encoder and parameters are ready for ingestion. `DefaultSemanticParams` supplies defaults; it does not itself allocate a sketch.
 
-```mermaid
-flowchart LR
-    P[Parameters] --> V{Validate configuration}
-    V -->|Invalid| E[Return error]
-    V -->|Valid| ENC[Build seeded encoder]
-    ENC --> S[Initialize empty summary]
-    S --> R[Return Sketch]
-```
+<img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/49eded9f-1731-4151-b8d4-319e4715c98d" />
+
 
 ### 2. `Add()` ingesting one observation
 
@@ -257,26 +229,7 @@ err := summary.Add(vector, value, itemID)
 
 `Add` returns only `error`, not an assignment-status object. A valid but ambiguous observation is processed successfully and returns `nil`. Invalid input increments rejection diagnostics. Repeated calls with the same observation are counted repeatedly. There is no core exactly-once guarantee.
 
-```mermaid
-flowchart TD
-    A[Add vector, value, itemID] --> V{Validate value and vector}
-    V -->|Invalid| R[Increment rejection diagnostic and return error]
-    V -->|Valid| Q[Normalize, rotate and quantize]
-    Q --> S[Scan retained representatives]
-    S --> C{Candidate classification}
-    C -->|One clear match| G[Increment genuine count and sum; offer exemplar]
-    C -->|Nearby but not clear| U[Increment quarantine once; attach ambiguity to up to two entries]
-    C -->|No nearby candidate| CAP{Free slot?}
-    CAP -->|Yes| N[Seed new entry with genuine count 1]
-    CAP -->|No| X[Evict lowest-upper-bound entry; track orphaned and inherited state]
-    X --> N
-    G --> P{Provisional and enough members?}
-    P -->|Yes| PC[Check pairwise compatibility; promote, re-anchor or dissolve]
-    P -->|No| END[Updated summary]
-    PC --> END
-    U --> END
-    N --> END
-```
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/ccfe6ab2-02c0-4e2d-97ca-eaadd2c82d5c" />
 
 **Implementation detail**
 
@@ -298,17 +251,8 @@ err := summary.AddBatch(vectors, values, itemIDs)
 6. Ingest encoded observations **in original index order**, using the same classification, seeding, replacement, ambiguity and probation logic as `Add`.
 7. Release the lock and return `nil`.
 
-```mermaid
-flowchart TD
-    A[AddBatch vectors, values, IDs] --> L{Slice lengths equal?}
-    L -->|No| E[ErrBatchLength and no ingestion]
-    L -->|Yes| V[Validate and encode every item]
-    V --> F{Any invalid item?}
-    F -->|Yes| B[Increment rejection diagnostic and return BatchError with index]
-    F -->|No| K[Acquire one sketch lock]
-    K --> I[Ingest items sequentially in input order]
-    I --> U[Release lock and return nil]
-```
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/878a62f2-e33e-4cb0-81f8-fb1fc4ab8faf" />
+
 
 **Important behavior**
 
@@ -339,16 +283,8 @@ None. `Lookup` does not add an observation, update exemplars, or increment input
 
 The returned entity contains `ID`, `Count`, `Sum`, `Mean`, `Ambiguous`, `AmbiguousSum`, `Exemplars`, `Provisional`, and `Aliases`. It does **not** return the nearest distance or a list of neighboring entities.
 
-```mermaid
-flowchart LR
-    Q[Lookup vector] --> ENC{Encode valid?}
-    ENC -->|No| FALSE[Empty entity, false]
-    ENC -->|Yes| S[Scan and classify]
-    S --> C{Exactly one clear match?}
-    C -->|No| FALSE
-    C -->|Yes| VIEW[Build entity intervals and copy metadata]
-    VIEW --> TRUE[Entity, true]
-```
+<img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/2e527f39-17c1-43c0-8645-a2a356a31489" />
+
 
 `found == false` does not mean the semantic concept never occurred. It may have been quarantined, fragmented, or removed from retained state by capacity replacement.
 
@@ -374,18 +310,8 @@ groups := summary.TopK(10, cardinex.ByCount)
 
 None. `TopK` ranks retained entity IDs, not guaranteed reconstructed real-world semantic concepts. Ambiguous mass is exposed separately rather than silently added to confident counts.
 
-```mermaid
-flowchart LR
-    A[TopK k, order] --> B[Build views for live entities]
-    B --> C{Ranking mode}
-    C -->|ByCount| D[Count upper]
-    C -->|BySum| E[Sum upper]
-    C -->|ByMean| F[Mean value]
-    D --> G[Sort descending; tie by lower ID]
-    E --> G
-    F --> G
-    G --> H[Return first k or all for nonpositive k]
-```
+<img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/bb703d7f-6358-4d13-97bc-fa0e0d522421" />
+
 
 ### 6. `Unmonitored()` querying an entity without a counter
 
@@ -427,14 +353,8 @@ stats := summary.Stats()
 
 None. `Stats()` is a consistent sketch-level diagnostic read, not a byte-level memory measurement.
 
-```mermaid
-flowchart LR
-    S[Stats] --> L[Lock summary]
-    L --> G[Read confident and quarantined totals]
-    G --> U[Compute Ubar and capacity usage]
-    U --> D[Copy rejection and lifecycle counters]
-    D --> R[Unlock and return Stats]
-```
+<img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/b40c7cdd-0c92-4e12-beb5-66df612229a1" />
+
 
 Use `Live`, `Capacity`, `Wq`, `Orphaned`, `Floor` and `Ubar` to inspect saturation and uncertainty. A high `Wq` means observations were not confidently assigned; `Orphaned` tracks quarantined count whose counter was evicted, dropped or dissolved.
 
@@ -458,14 +378,8 @@ snapshot := summary.Clone()
 
 The original sketch is unchanged. Subsequent `Add` or `Merge` operations on either sketch do not mutate the other's live counters. The immutable encoder may be shared safely.
 
-```mermaid
-flowchart LR
-    A[Clone] --> L[Lock source]
-    L --> B[Copy global state and config]
-    B --> C[Deep-copy codes, counters, members, aliases and exemplars]
-    C --> D[Reuse immutable encoder]
-    D --> E[Return independent Sketch]
-```
+<img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/72c95365-a267-4bd2-a396-57d294ffb108" />
+
 
 `Clone()` is the implemented snapshot operation. There is no separate public `snapshot()` method in model v0. A clone is an in-memory sketch, not serialized bytes.
 
@@ -489,14 +403,8 @@ data, err := summary.MarshalBinary()
 
 None. The resulting bytes are a portable representation of the state captured under the lock.
 
-```mermaid
-flowchart LR
-    A[MarshalBinary] --> B[Lock and read state]
-    B --> C[Encode params]
-    C --> D[Encode global state and each entry]
-    D --> E[Frame CDNX envelope]
-    E --> F[Return bytes]
-```
+<img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/404a2653-0b15-4ecd-ae42-0d411973ee9b" />
+
 
 ### 10. `Unmarshal()` and `UnmarshalBinary()` restoring state
 
@@ -523,16 +431,8 @@ err = summary.UnmarshalBinary(data)
 
 `semantic.Unmarshal(data)` creates a new sketch. `summary.UnmarshalBinary(data)` replaces the receiver's state only after the temporary decode succeeds.
 
-```mermaid
-flowchart TD
-    A[CDNX bytes] --> B{Validate envelope and parameters}
-    B -->|Invalid| E[Return error; receiver unchanged]
-    B -->|Valid| C[Decode into temporary sketch]
-    C --> D{Payload and state valid?}
-    D -->|No| E
-    D -->|Yes| F[Atomically replace receiver state under lock]
-    F --> G[Return restored sketch]
-```
+<img width="1199" height="1312" alt="image" src="https://github.com/user-attachments/assets/0d837bc0-f290-48a0-81ac-611488639c51" />
+
 
 ### 11. `Merge()` combining worker summaries
 
@@ -565,25 +465,8 @@ The receiver (`workerA`) is modified in place. The source (`workerB`) remains un
 
 The merge is deterministic for the same two states and execution order, but it is not promised to be exactly associative across arbitrary merge trees. Aliasing is not the same as confidently fusing entities. Inherited mass is carried as approximation metadata rather than relabeled as genuine observations.
 
-```mermaid
-flowchart TD
-    A[Receiver A + source B] --> V{Same semantic type and exact params?}
-    V -->|No| E[Return incompatible or self-merge error]
-    V -->|Yes| L[Lock both sketches in stable order]
-    L --> UB[Read unmonitored bounds from A and B]
-    UB --> SORT[Sort B entries by ID]
-    SORT --> C{Classify each B entry against original A entries}
-    C -->|Clear| F[Fuse aggregates, uncertainty, aliases and exemplars]
-    C -->|Ambiguous| AL[Clone B entry; record reciprocal aliases]
-    C -->|No match| CL[Clone B entry]
-    F --> FLOOR[Apply missing-side floors]
-    AL --> FLOOR
-    CL --> FLOOR
-    FLOOR --> CAP[Keep highest-upper-bound entries within Capacity]
-    CAP --> TOTAL[Combine global totals and diagnostics]
-    TOTAL --> PROB[Run deferred probation checks]
-    PROB --> DONE[Unlock with receiver updated]
-```
+<img width="1199" height="1312" alt="image" src="https://github.com/user-attachments/assets/81c1fbb2-c061-4de2-ac3c-b1e2e4491d5a" />
+
 
 ### 12. `Diff()` comparing two summaries
 
@@ -617,20 +500,8 @@ None. `Diff` does not merge, insert, or modify either summary.
 
 Each `EntityDelta` includes `IDA`, `IDB`, `InA`, `InB`, count/sum/mean difference estimates and `Significant`. Missing IDs are represented as zero, with presence flags clarifying which side contains the entry.
 
-```mermaid
-flowchart TD
-    A[Diff A minus B] --> V{Compatible and distinct sketches?}
-    V -->|No| ERR[Return error]
-    V -->|Yes| UB[Read unmonitored bounds]
-    UB --> LOOP[Walk A entries by ID]
-    LOOP --> M{Clear match in B?}
-    M -->|Yes| BOTH[Compare A entity with B entity]
-    M -->|No| ONLYA[Compare A entity with B fallback]
-    BOTH --> LEFT[Walk remaining unmatched B entries]
-    ONLYA --> LEFT
-    LEFT --> ONLYB[Compare A fallback with B entity]
-    ONLYB --> OUT[Return matched, A-only, B-only deltas]
-```
+<img width="1199" height="1312" alt="image" src="https://github.com/user-attachments/assets/7b8d8e77-dbbb-46f4-ad81-534f358ba447" />
+
 
 **How to interpret `Significant`**
 
@@ -665,20 +536,8 @@ Likewise, `snapshot()` is not a separate public method. Use `Clone()`.
 
 A customer-support analytics service can use the functions together in this sequence.
 
-```mermaid
-flowchart TD
-    MODEL[Choose one embedding model] --> NEW[NewSemantic with matching dimension and params]
-    NEW --> STORE[Store raw event in application database]
-    STORE --> EMB[Generate embedding]
-    EMB --> ADD[Add or AddBatch]
-    ADD --> READ[Lookup an issue / TopK frequent issues]
-    READ --> MON[Stats for capacity and uncertainty]
-    MON --> SNAP[Clone at reporting checkpoint]
-    SNAP --> SAVE[MarshalBinary to persistent storage]
-    SAVE --> LOAD[Unmarshal for recovery]
-    LOAD --> SCALE[Merge compatible worker summaries]
-    SCALE --> COMP[Diff checkpoints for entity-level changes]
-```
+<img width="1774" height="887" alt="image" src="https://github.com/user-attachments/assets/cc2e6f8a-a851-47bb-864b-79daf64751db" />
+
 
 1. **Configure.** Pick an external embedding model and a consistent preprocessing policy. Create a sketch with matching `Dim`, `Tau`, `Band`, `Bits`, `Capacity` and `Seed`.
 2. **Ingest.** Keep raw messages in your own database. Embed each message and call `Add` or `AddBatch` with a bounded score and an item ID.
@@ -691,18 +550,8 @@ flowchart TD
 
 ## Distributed execution
 
-```mermaid
-flowchart LR
-    EA[Raw events A] --> WA[Worker A local Cardinex]
-    EB[Raw events B] --> WB[Worker B local Cardinex]
-    EC[Raw events C] --> WC[Worker C local Cardinex]
-    WA --> M[Merge into aggregator]
-    WB --> M
-    WC --> M
-    M --> CS[Combined Cardinex]
-    CS --> READ[Lookup / TopK / Stats]
-    CS --> PERSIST[Clone / MarshalBinary]
-```
+<img width="2172" height="724" alt="image" src="https://github.com/user-attachments/assets/4f2b9cb6-405d-4666-a864-59a92d1674c2" />
+
 
 Only compact summary state needs to cross the network for a merge. `Merge` operates on compatible sketch instances and modifies its receiver. If an application requires the original worker summaries to remain unchanged, merge into a clone rather than directly into a worker's live sketch.
 
