@@ -1,151 +1,173 @@
 # Cardinex
 
-**Cardinex is a bounded-memory semantic streaming data structure that organizes embeddings into compact semantic groups and maintains approximate frequency and aggregate information as new observations arrive.**
+**A bounded-memory semantic streaming data structure for embedding-based aggregation.**
 
-Applications supply embeddings from the model of their choice. Cardinex manages the resulting streaming summary, allowing an application to work with retained semantic groups instead of storing and repeatedly processing every individual embedding.
+Cardinex takes embeddings produced by your application, assigns confident observations to retained semantic representatives, and maintains compact count, sum, mean, and exemplar state. It also tracks observations that cannot be assigned confidently, supports snapshots and binary persistence, and merges compatible summaries produced by different workers.
 
-Cardinex is useful for continuous embedding streams that need semantic grouping, approximate counts and aggregates, frequent-group discovery, snapshots, compact persistence, and compatible distributed merging.
+Cardinex does not generate embeddings, retain raw messages, perform automatic event deduplication, or provide a general-purpose vector search index.
 
-> **Implementation status:** the repository contains a working Go model-v0 semantic sketch, C ABI, SDK bindings, HTTP/MCP service, conformance fixtures, and tests. The public API documented below describes that implementation. Where this README uses a common conceptual name that does not exist as a method, it is explicitly labeled.
+## Contents
 
-## Overview
-
-Cardinex keeps a limited number of semantic representatives. When an embedding arrives, it is compared with those representatives. A clear match updates the associated summary; an unclear match is tracked separately; an unmatched embedding creates a representative or replaces the least-prominent retained entry when capacity is full.
-
-The result is compact state that supports:
-
-- continuous embedding ingestion;
-- semantic grouping with configurable angular thresholds;
-- approximate count, sum, and mean intervals per retained group;
-- ranked retained groups through `TopK`;
-- bounded item-ID exemplars;
-- deep-copy snapshots through `Clone`;
-- binary export/import through the CDNX format;
-- merging compatible summaries from separate workers.
-
-Cardinex does not generate embeddings, store original messages, deduplicate writes, or replace raw-data storage when exact retrieval is required.
+- [Why Cardinex](#why-cardinex)
+- [End-to-end architecture](#end-to-end-architecture)
+- [What the engine stores](#what-the-engine-stores)
+- [Quick start](#quick-start)
+- [API execution flows](#api-execution-flows)
+  - [NewSemantic](#1-newsemantic-creating-a-summary)
+  - [Add](#2-add-ingesting-one-observation)
+  - [AddBatch](#3-addbatch-ingesting-a-batch)
+  - [Lookup](#4-lookup-querying-a-semantic-representative)
+  - [TopK](#5-topk-ranking-retained-entities)
+  - [Unmonitored](#6-unmonitored-querying-an-entity-without-a-counter)
+  - [Stats](#7-stats-reading-operational-state)
+  - [Clone](#8-clone-creating-a-point-in-time-copy)
+  - [MarshalBinary](#9-marshalbinary-exporting-state)
+  - [Unmarshal and UnmarshalBinary](#10-unmarshal-and-unmarshalbinary-restoring-state)
+  - [Merge](#11-merge-combining-worker-summaries)
+  - [Diff](#12-diff-comparing-two-summaries)
+  - [Other public helpers](#13-other-public-helpers)
+  - [memory_bytes](#14-memory_bytes-planned-not-implemented)
+- [Complete developer journey](#complete-developer-journey)
+- [Distributed execution](#distributed-execution)
+- [Configuration](#configuration)
+- [SDKs and service](#sdks-and-service)
+- [Operational boundaries](#operational-boundaries)
+- [Repository and build](#repository-and-build)
 
 ## Why Cardinex?
 
-Imagine a customer-support system receiving:
+Suppose a support application receives these messages.
 
 - “My payment failed.”
 - “Transaction declined.”
 - “I cannot complete checkout.”
 
-A `HashMap` treats these as different keys. An embedding model can place similar messages near each other, but it does not maintain stream counts. A developer can assemble vector storage, similarity matching, clustering, counters, and periodic aggregation, but that leaves them responsible for coordinating state and enforcing a memory limit.
+A hash map counts them as different strings. An embedding model turns them into vectors, but does not maintain streaming frequencies. A vector database can retrieve nearby vectors, but retaining and searching vectors is a different job from maintaining a small, continuously updated statistical summary.
 
-Cardinex provides an integrated, compact streaming abstraction for that job.
+Cardinex gives the application one stateful interface for semantic assignment, bounded aggregation, uncertainty tracking, and distributed summary operations. It can be used alongside raw-data storage, an embedding model, and a vector database.
 
-| Tool | Primary purpose | How Cardinex differs |
-| --- | --- | --- |
-| HashMap | Exact-key counting | Cardinex groups by embedding proximity rather than exact identity. |
-| Vector database | Store and retrieve vectors | Cardinex maintains compact streaming statistics; it is not a retrieval store. |
-| Clustering library | Build related groups | Cardinex focuses on incremental bounded state and aggregate maintenance. |
-| Frequency sketch | Estimate counts for predefined keys | Cardinex creates and manages embedding-derived retained keys. |
+| System | Main job |
+| --- | --- |
+| Hash map | Count exact keys. |
+| Vector database | Store and retrieve individual vectors. |
+| Clustering library | Partition or group observations. |
+| Frequency sketch | Approximate counts for existing keys. |
+| **Cardinex** | Create retained embedding-derived entities and maintain compact streaming statistics about them. |
 
-These tools can be combined with Cardinex. Cardinex does not claim that they cannot reproduce parts of this workflow.
-
-## How it works
+## End-to-end architecture
 
 ```mermaid
 flowchart LR
-    A[Application] --> B[Embedding model]
-    B --> IN[Cardinex add]
-    subgraph ENGINE[Cardinex engine]
-        D[Representative and counter state]
-        E[Aggregate state]
-        F[Ambiguity and rejection state]
-        G[Exemplars and configuration]
+    APP[Application events] --> MODEL[External embedding model]
+    MODEL --> ADD[Add / AddBatch]
+    ADD --> VALID[Validate and encode]
+    VALID --> CLASS[Classify against retained representatives]
+
+    subgraph CORE[Cardinex summary]
+        REP[Representative codes and IDs]
+        AGG[Genuine and inherited aggregate state]
+        UNC[Ambiguity, floor and orphaned state]
+        EX[Bounded exemplar IDs]
+        CFG[Configuration and diagnostics]
     end
-    IN --> D
-    D --> E
-    D --> F
-    D --> G
-    D --> H[Lookup]
-    D --> I[TopK]
-    D --> J[Stats / Clone / Serialize]
-    D --> K[Merge]
+
+    CLASS --> REP
+    CLASS --> AGG
+    CLASS --> UNC
+    CLASS --> EX
+    CLASS --> CFG
+
+    CORE --> READ[Lookup / TopK / Unmonitored / Stats]
+    CORE --> COPY[Clone / MarshalBinary]
+    CORE --> DIST[Merge / Diff]
 ```
 
-### Engine lifecycle
+The engine processes vectors, not raw text. The embedding model must remain consistent across ingestion, lookup, and summaries intended for merging. Model v0 does not store an embedding-model identifier, so the application must enforce that compatibility.
 
-1. The application receives an observation and generates an embedding.
-2. It calls `Add` or `AddBatch` with the embedding, a bounded numeric value, and an item ID.
-3. Cardinex validates and encodes the vector, then compares it with retained representatives.
-4. A clear match updates a retained group. An ambiguous nearby match is recorded as ambiguous. An unmatched vector seeds a new entry or triggers bounded replacement.
-5. The compact state can be read with `Lookup`, `TopK`, and `Stats`, copied with `Clone`, serialized, or merged with another compatible sketch.
+## What the engine stores
 
-## Internal components
+The semantic engine is implemented in [`core/semantic`](core/semantic). Model v0 has **one `Capacity` limit** for live entries. It does not have separately configurable center-table and counter-table capacities.
 
-### Representative and counter state
+| State | Actual purpose | Updated by |
+| --- | --- | --- |
+| Representative identity | Entity ID, compact vector code, provisional status, aliases and probation members. | `Add`, probation, `Merge` |
+| Genuine aggregate | Count of confidently assigned observations and their compensated value sum. | `Add`, probation, `Merge` |
+| Inherited aggregate | Counter mass and sum uncertainty carried through replacement or merging. | Seeding, replacement, `Merge` |
+| Entity ambiguity | Quarantined count and value sum attached to nearby candidates. | Ambiguous `Add`, probation, `Merge` |
+| Global uncertainty | Quarantined mass, orphaned mass, floor and unmonitored upper bound. | `Add`, probation, replacement, `Merge` |
+| Exemplars | Up to `Exemplars` distinct item IDs chosen by seeded priority. | `Add`, probation, `Merge` |
+| Diagnostics | Rejection reasons, promotions, re-anchors, dissolutions, fusions, aliases and drops. | Mutating operations |
 
-Model v0 stores a compact code for each retained representative and the aggregate/counter state associated with it. The configured `Capacity` limits the number of live entries. The implementation does **not** currently expose separate center-table and frequency-counter capacities; a single capacity bounds both.
+### How embeddings are represented
 
-Embeddings are normalized, transformed with a seeded randomized-Hadamard rotation, and stored as 1-, 2-, or 4-bit codes. Cardinex compares those codes using estimated angular distance. The engine uses a linear scan of live representatives.
+The encoder normalizes a valid vector, pads its dimension to a power of two, applies three rounds of seeded randomized-Hadamard rotation, then quantizes the rotated coordinates to **1, 2 or 4 bits**. The stored representative is a compact `quant.Code`, not the original float embedding. Candidate matching uses estimated angular distance between codes. Model v0 scans retained representatives linearly.
 
-### Aggregate state
+### How an entity's count differs from its counter estimate
 
-Each retained entity tracks genuine observation count and value sum, inherited mass from replacement or merging, and enough information to return count, sum, and mean intervals. Values must fall within the configured `ValueMin` and `ValueMax` range.
+A retained entry stores genuine count and sum separately from inherited mass. When an entry is replaced, the new representative starts from the incoming observation, while inherited counter uncertainty is retained as accounting metadata. This prevents an evicted entity's historical estimate from being mistaken for genuine observations of the new entity.
 
-### Ambiguity, unresolved, and rejection state
+### How a match is classified
 
-Cardinex deliberately does not force every nearby observation into a group. A configurable `Band` around `Tau` creates an ambiguity zone. Observations near more than one representative, or in this zone, are quarantined and reported separately from confident aggregates.
+Cardinex scans for **all** retained representatives within `Tau + Band`, then sorts candidates by estimated distance and entity ID.
 
-When capacity is full and a new representative is needed, the engine replaces the entry with the smallest retained upper bound. It records inherited and orphaned information so that replacement is not presented as exact deletion. Invalid vectors or values are rejected and counted in diagnostics.
+- **Confident** only when there is exactly one candidate and its distance is at most `Tau - Band`.
+- **Ambiguous** when there is at least one nearby candidate but the confident rule fails. This includes a single candidate in the uncertainty band and multiple nearby candidates.
+- **Unmatched** when there are no candidates within `Tau + Band`.
 
-### Exemplars
+The distinction matters because `Lookup` and `Add` use the same classification rule. Nearest does not necessarily mean confidently matched.
 
-Each entity can retain up to `Exemplars` item IDs, chosen with a deterministic seeded priority. These IDs let an application retrieve examples from its own data store. Cardinex does not retain full original observations.
-
-### Configuration and metadata
-
-The semantic parameters include `Dim`, `Capacity`, `Tau`, `Band`, `Bits`, `ValueMin`, `ValueMax`, `Exemplars`, `Probation`, `Refine`, and `Seed`. Compatible configuration matters because independent sketches must encode and compare vectors in the same way before they can merge.
-
-`Refine` is present in the parameter type but unsupported in model v0. `Stats` reports live usage, confident and quarantined mass, orphaned mass, rejection counts, and promotion/merge diagnostics.
-
-## Getting started
+## Quick start
 
 ### Go
 
 ```go
+package main
+
 import (
     "fmt"
 
-    cardinex "github.com/dippendicular/cardinex/sdk/go"
     "github.com/dippendicular/cardinex/core/semantic"
+    cardinex "github.com/dippendicular/cardinex/sdk/go"
 )
 
-p := cardinex.DefaultSemanticParams(384, 0.6, 1)
-p.Capacity = 4096
+func main() {
+    params := cardinex.DefaultSemanticParams(384, 0.6, 1)
+    params.Capacity = 4096
 
-summary, err := cardinex.NewSemantic(p)
-if err != nil {
-    panic(err)
-}
+    summary, err := cardinex.NewSemantic(params)
+    if err != nil {
+        panic(err)
+    }
 
-if err := summary.Add(embedding, 1.0, itemID); err != nil {
-    panic(err)
-}
+    // Replace this illustrative vector with a real model embedding.
+    vector := make([]float32, 384)
+    vector[0] = 1
 
-if entity, ok := summary.Lookup(embedding); ok {
-    fmt.Println(entity.ID, entity.Count.Lower, entity.Count.Upper)
-}
+    if err := summary.Add(vector, 1.0, 101); err != nil {
+        panic(err)
+    }
 
-for _, entity := range summary.TopK(10, cardinex.ByCount) {
-    fmt.Println(entity.ID, entity.Count, entity.Exemplars)
-}
+    if entity, found := summary.Lookup(vector); found {
+        fmt.Println(entity.ID, entity.Count, entity.Sum, entity.Mean)
+    }
 
-snapshot := summary.Clone()
-data, err := snapshot.MarshalBinary()
-if err != nil {
-    panic(err)
+    for _, entity := range summary.TopK(10, cardinex.ByCount) {
+        fmt.Println(entity.ID, entity.Count, entity.Exemplars)
+    }
+
+    fmt.Println(summary.Stats())
+
+    snapshot := summary.Clone()
+    data, err := snapshot.MarshalBinary()
+    if err != nil {
+        panic(err)
+    }
+    restored, err := semantic.Unmarshal(data)
+    if err != nil {
+        panic(err)
+    }
+    _ = restored
 }
-restored, err := semantic.Unmarshal(data)
-if err != nil {
-    panic(err)
-}
-_ = restored
 ```
 
 ### Python
@@ -154,249 +176,604 @@ _ = restored
 import numpy as np
 import cardinex
 
+# embeddings and values are supplied by the application.
 with cardinex.Semantic(dim=384, tau=0.6, seed=1) as summary:
-    summary.add_batch(embeddings.astype(np.float32), values=losses)
-    print(summary.topk(10, by="mean"))
+    summary.add_batch(embeddings.astype(np.float32), values=values)
+    print(summary.topk(10, by="count"))
 ```
 
-The Python binding uses the C ABI. The C ABI also supports zero-copy, row-major float32 batch input.
+The Python SDK uses the C ABI. Its batch input supports row-major `float32` arrays. SDK naming may differ from the Go methods documented below.
 
-## Core API
+## API execution flows
 
-### Creating a summary
+The following sections describe the **implemented Go semantic engine**, rather than hypothetical APIs. Each operation explains the caller input, processing order, state changes, return value, and failure behavior. Internal steps are based on [`sketch.go`](core/semantic/sketch.go), [`query.go`](core/semantic/query.go), [`merge.go`](core/semantic/merge.go), and [`serialize.go`](core/semantic/serialize.go).
 
-**Implemented:** `semantic.New(params)` and `cardinex.NewSemantic(params)` create an empty semantic summary.
-
-Creation validates the embedding dimension, capacity, threshold/band relationship, quantization width, value bounds, exemplar/probation limits, and unsupported refinement flag. It then initializes the encoder and empty state.
-
-Use identical parameters for summaries that will be merged. The current implementation treats parameter equality as compatibility; it has no separate embedding-model-name field, so applications should enforce model provenance themselves.
-
-### Adding observations
-
-**Implemented:**
+### 1. `NewSemantic()` creating a summary
 
 ```go
-err := summary.Add(embedding []float32, value float64, itemID uint64)
-err := summary.AddBatch(vectors [][]float32, values []float64, itemIDs []uint64)
+params := cardinex.DefaultSemanticParams(384, 0.6, 1)
+params.Capacity = 4096
+summary, err := cardinex.NewSemantic(params)
 ```
 
-`Add` performs this flow:
+**Execution flow**
 
-1. Validates vector length, finite coordinates, nonzero norm, and value bounds.
-2. Encodes the normalized vector into a compact code.
-3. Finds retained representatives within the matching area.
-4. Makes one of three decisions:
-   - exactly one clear match: update that entity;
-   - one or more ambiguous nearby matches: record ambiguous mass and do not add it to a confident entity;
-   - no nearby match: seed an entity, replacing the lowest-upper-bound entry if capacity is full.
-5. Updates genuine count/sum, bounded exemplars, and operational diagnostics for confident observations.
-6. Runs the configured probation check when needed.
+1. Receive `semantic.Params`, including dimension, capacity, thresholds, precision, value bounds, exemplar limit, probation limit and seed.
+2. Validate positive dimension and capacity, supported bit width, valid threshold/band relationship, nonnegative finite value range, and exemplar/probation limits.
+3. Reject `Refine = true`, which is not implemented in model v0.
+4. Create a seeded quantization encoder for the configured dimension and bit width.
+5. Allocate a new sketch identity and initialize empty representative and aggregate state.
+6. Return the new sketch or a configuration error.
+
+**State after success**
+
+The sketch has no live entities, no observations, and zero operational counters. Its encoder and parameters are ready for ingestion. `DefaultSemanticParams` supplies defaults; it does not itself allocate a sketch.
+
+```mermaid
+flowchart LR
+    P[Parameters] --> V{Validate configuration}
+    V -->|Invalid| E[Return error]
+    V -->|Valid| ENC[Build seeded encoder]
+    ENC --> S[Initialize empty summary]
+    S --> R[Return Sketch]
+```
+
+### 2. `Add()` ingesting one observation
+
+```go
+err := summary.Add(vector, value, itemID)
+```
+
+**Input**
+
+- `vector` is a `[]float32` matching the configured dimension.
+- `value` is a finite `float64` within `ValueMin` and `ValueMax`.
+- `itemID` is a `uint64` used for entity seeding and optional exemplars.
+
+**Execution flow**
+
+1. Check the value range. The encoder checks vector length, finite coordinates and nonzero norm.
+2. Normalize, zero-pad, rotate and quantize the vector into a compact code.
+3. Lock the sketch for the state update. Invalid input increments the appropriate rejection diagnostic and returns an error without ingesting the observation.
+4. Scan all retained codes for candidates at estimated angular distance no greater than `Tau + Band`.
+5. Sort candidates by distance and entity ID, then choose the confident, ambiguous or unmatched branch.
+6. **Confident branch.** Increment the matched entry's genuine count, add the value using compensated summation, increment its confident-observation diagnostic, offer the item ID to its bounded exemplar set, and update global confident count and sum.
+7. **Ambiguous branch.** Increment global quarantined count and sum **once**. Attach ambiguous count and sum to up to the two nearest candidate entries. Do **not** increment a confident entity's genuine count or sum.
+8. **Unmatched branch.** Calculate the current unmonitored upper bound. If capacity is available, append a new entry. If full, choose the entry with the lowest count upper bound, breaking ties by lower entity ID, remove it, and record its attached ambiguous count as orphaned.
+9. Seed the new entry from the incoming code with genuine count `1` and genuine sum `value`. Record inherited uncertainty separately, generate a seeded entity ID, initialize provisional status if probation is enabled, and offer the seed item as an exemplar.
+10. If the confident match belongs to a provisional entry, add a distinct probation member when eligible. Once the configured member threshold is reached, run the probation decision described below.
+11. Release the lock and return `nil` on successful processing.
+
+**Probation flow**
+
+1. A newly seeded entry is provisional when `Probation > 0`.
+2. Later confident assignments contribute compact member codes and distinct item IDs, up to the configured probation limit.
+3. When enough members exist, compare the stored members pairwise.
+4. If they are not mutually compatible, dissolve the entry. Its genuine mass moves to global quarantined accounting, its attached ambiguity becomes orphaned, and the floor is updated.
+5. If members are mutually compatible but not all compatible with the original seed representative, re-anchor the representative to the first member. If the seed is still live, remove its genuine contribution and transfer that observation to quarantine.
+6. Otherwise, or after a successful re-anchor, mark the entry non-provisional, clear probation members and increment the promotion diagnostic.
+
+**Return and side effects**
+
+`Add` returns only `error`, not an assignment-status object. A valid but ambiguous observation is processed successfully and returns `nil`. Invalid input increments rejection diagnostics. Repeated calls with the same observation are counted repeatedly. There is no core exactly-once guarantee.
 
 ```mermaid
 flowchart TD
-    A[Incoming embedding] --> B[Validate and encode]
-    B --> C{Clear retained match?}
-    C -->|Yes| D[Update entity aggregate and exemplars]
-    C -->|No, ambiguous nearby match| E[Record ambiguous state]
-    C -->|No nearby match| F{Capacity available?}
-    F -->|Yes| G[Seed new entity]
-    F -->|No| H[Replace lowest-bound entry and seed]
-    D --> I[Updated compact summary]
-    E --> I
-    G --> I
-    H --> I
+    A[Add vector, value, itemID] --> V{Validate value and vector}
+    V -->|Invalid| R[Increment rejection diagnostic and return error]
+    V -->|Valid| Q[Normalize, rotate and quantize]
+    Q --> S[Scan retained representatives]
+    S --> C{Candidate classification}
+    C -->|One clear match| G[Increment genuine count and sum; offer exemplar]
+    C -->|Nearby but not clear| U[Increment quarantine once; attach ambiguity to up to two entries]
+    C -->|No nearby candidate| CAP{Free slot?}
+    CAP -->|Yes| N[Seed new entry with genuine count 1]
+    CAP -->|No| X[Evict lowest-upper-bound entry; track orphaned and inherited state]
+    X --> N
+    G --> P{Provisional and enough members?}
+    P -->|Yes| PC[Check pairwise compatibility; promote, re-anchor or dissolve]
+    P -->|No| END[Updated summary]
+    PC --> END
+    U --> END
+    N --> END
 ```
 
-An `Add` call returns an error for invalid input. It does not return a structured assignment status. `AddBatch` is all-or-nothing: it validates every item first, returns the first failing index in `BatchError`, and does not apply a partially invalid batch.
+**Implementation detail**
 
-Inserting the same observation twice processes it twice. Cardinex has no automatic deduplication or exactly-once guarantee. Counter replacement does not mean that an unrelated geometric record has been silently accepted as the replacement: inherited counter mass is tracked separately from genuine observations, and the new representative is seeded from the new vector.
+The replacement decision uses an entry's **upper bound**, not its genuine count. The replacement's inherited mass is approximation metadata and is not added to its genuine count. A newly seeded representative is based on the incoming vector, not the evicted representative's geometry.
 
-### Querying semantic groups
-
-**Implemented name:** `Lookup`, not `query`.
+### 3. `AddBatch()` ingesting a batch
 
 ```go
-entity, found := summary.Lookup(embedding []float32)
+err := summary.AddBatch(vectors, values, itemIDs)
 ```
 
-`Lookup` validates and encodes the input, searches retained representatives, and returns an entity only when there is exactly one clear match. The result includes its ID, count/sum/mean intervals, ambiguity attached to that entity, exemplar IDs, provisional state, and aliases.
+**Execution flow**
 
-`found == false` means the vector is invalid, unmatched, or ambiguous. It does not mean that a related concept has never appeared: it might be quarantined, fragmented across retained entities, or no longer explicitly monitored after replacement. `Lookup` does not return the merely nearest representative or a matching distance.
+1. Check that the vector, value and item-ID slices have identical lengths. Return `ErrBatchLength` otherwise.
+2. Validate and encode **every** observation before ingesting any of them.
+3. If item `i` is invalid, increment the appropriate rejection diagnostic and return `*BatchError` containing the first failing index and underlying error.
+4. On validation failure, apply **none** of the batch's observations to the semantic summary. The rejection diagnostic is the exception to the no-state-change behavior.
+5. When all items are valid, acquire the sketch lock once.
+6. Ingest encoded observations **in original index order**, using the same classification, seeding, replacement, ambiguity and probation logic as `Add`.
+7. Release the lock and return `nil`.
 
-For a payment-related complaint, generate an embedding with the same model/configuration used for ingestion, then call `Lookup`. If it returns an entity, inspect `entity.Count`, `entity.Sum`, `entity.Mean`, and `entity.Exemplars`. If it does not, call `Unmonitored()` to read the sketch-wide bound for an unretained entity.
+```mermaid
+flowchart TD
+    A[AddBatch vectors, values, IDs] --> L{Slice lengths equal?}
+    L -->|No| E[ErrBatchLength and no ingestion]
+    L -->|Yes| V[Validate and encode every item]
+    V --> F{Any invalid item?}
+    F -->|Yes| B[Increment rejection diagnostic and return BatchError with index]
+    F -->|No| K[Acquire one sketch lock]
+    K --> I[Ingest items sequentially in input order]
+    I --> U[Release lock and return nil]
+```
 
-### Finding frequent semantic groups
+**Important behavior**
 
-**Implemented:**
+`AddBatch` is all-or-nothing for observation ingestion, not a database transaction spanning external storage. Duplicate item IDs do not make ingestion idempotent. Batch order can affect representative creation and replacement.
+
+### 4. `Lookup()` querying a semantic representative
+
+```go
+entity, found := summary.Lookup(vector)
+```
+
+**Execution flow**
+
+1. Encode the supplied vector with the sketch's existing encoder. Invalid vectors immediately return `Entity{}` and `false`.
+2. Acquire the sketch lock and scan live representatives within `Tau + Band`.
+3. Sort candidates by estimated distance and entity ID.
+4. Apply the same confident-match rule as `Add`, requiring **exactly one** nearby candidate within `Tau - Band`.
+5. If the match is ambiguous or absent, return an empty entity and `false`.
+6. On a confident match, construct a public `Entity` view from the retained entry.
+7. Derive count, sum and mean estimates and their lower/upper bounds from genuine and inherited state.
+8. Copy exemplar IDs and aliases, include attached ambiguous count/sum and provisional status, then return the entity and `true`.
+
+**State mutation**
+
+None. `Lookup` does not add an observation, update exemplars, or increment input-rejection diagnostics.
+
+**Output**
+
+The returned entity contains `ID`, `Count`, `Sum`, `Mean`, `Ambiguous`, `AmbiguousSum`, `Exemplars`, `Provisional`, and `Aliases`. It does **not** return the nearest distance or a list of neighboring entities.
+
+```mermaid
+flowchart LR
+    Q[Lookup vector] --> ENC{Encode valid?}
+    ENC -->|No| FALSE[Empty entity, false]
+    ENC -->|Yes| S[Scan and classify]
+    S --> C{Exactly one clear match?}
+    C -->|No| FALSE
+    C -->|Yes| VIEW[Build entity intervals and copy metadata]
+    VIEW --> TRUE[Entity, true]
+```
+
+`found == false` does not mean the semantic concept never occurred. It may have been quarantined, fragmented, or removed from retained state by capacity replacement.
+
+### 5. `TopK()` ranking retained entities
 
 ```go
 groups := summary.TopK(10, cardinex.ByCount)
-// Other ranking modes: cardinex.BySum and cardinex.ByMean.
+// Alternative orders are BySum and ByMean.
 ```
 
-`TopK` reads live entities, derives their public aggregate views, sorts by the requested metric, and applies deterministic ID tie-breaking. Count and sum ranking use interval upper bounds; mean ranking uses the exposed mean value. `k <= 0` returns every retained entity.
+**Execution flow**
 
-The output ranks retained IDs, not perfectly reconstructed real-world concepts. One concept can occupy several centers, which splits its apparent frequency. Model v0 preserves aliases created during merge but does not provide general group reconciliation.
+1. Acquire the sketch lock.
+2. Walk every live counter/representative entry.
+3. Build a public `Entity` view for each, including count, sum, mean intervals, ambiguity, exemplars and aliases.
+4. Select a ranking value. `ByCount` uses `Count.Upper`; `BySum` uses `Sum.Upper`; `ByMean` uses `Mean.Value`.
+5. Sort descending by the selected value.
+6. Break equal-ranking ties by **ascending entity ID**.
+7. If `k > 0`, return at most `k` entries. If `k <= 0`, return all retained entries.
+8. Release the lock and return the entity slice.
 
-Illustrative output:
+**State mutation**
 
-| Rank | Representative ID | Count interval | Example IDs |
-| --- | ---: | ---: | --- |
-| 1 | 8012 | 412–435 | `104`, `220`, `841` |
-| 2 | 1297 | 201–219 | `502`, `878` |
+None. `TopK` ranks retained entity IDs, not guaranteed reconstructed real-world semantic concepts. Ambiguous mass is exposed separately rather than silently added to confident counts.
 
-The values above are examples, not benchmark results.
+```mermaid
+flowchart LR
+    A[TopK k, order] --> B[Build views for live entities]
+    B --> C{Ranking mode}
+    C -->|ByCount| D[Count upper]
+    C -->|BySum| E[Sum upper]
+    C -->|ByMean| F[Mean value]
+    D --> G[Sort descending; tie by lower ID]
+    E --> G
+    F --> G
+    G --> H[Return first k or all for nonpositive k]
+```
 
-### Understanding memory usage
+### 6. `Unmonitored()` querying an entity without a counter
 
-**Planned name:** `memory_bytes()` is not implemented in model v0.
+```go
+count, sum := summary.Unmonitored()
+```
 
-The current engine is bounded by `Capacity`, but it does not expose a public analytical byte count. The maintained state includes compact representative codes, aggregate/counter fields, entity IDs, aliases, probation members, exemplar IDs, configuration, and Go container overhead. Precision (`Bits`) and padded embedding dimension affect code size.
+**Execution flow**
 
-Do not substitute process RSS for analytical state size: RSS includes the runtime, allocator, and unrelated application state. A future `memory_bytes()` API should report every maintained structure. It should also count any added indexes or projection state.
+1. Acquire the sketch lock.
+2. Read the current global floor.
+3. If the sketch is full, find the smallest count upper bound among retained entries and take the larger of that bound and the floor. If it is not full, use the floor alone.
+4. Build the count interval for an entity with no retained counter, starting at zero and ending at the computed upper bound.
+5. Build the corresponding value-sum interval using the configured maximum value.
+6. Release the lock and return both estimates.
 
-Model v0 has one shared capacity rather than separately tunable center and counter capacities. Developers can currently tune `Capacity`, `Bits`, `Exemplars`, and `Probation`; lower capacity or smaller codes reduce retained state at the cost of representation detail.
+**State mutation**
 
-### Creating snapshots
+None. This is a sketch-wide uncertainty bound for an **unmonitored** entity. It does not retrieve a missing entity or assert that its frequency is zero.
 
-**Implemented name:** `Clone`, not `snapshot`.
+### 7. `Stats()` reading operational state
+
+```go
+stats := summary.Stats()
+```
+
+**Execution flow**
+
+1. Acquire the sketch lock.
+2. Read global confidently aggregated count and value sum (`W`, `WSum`).
+3. Read globally quarantined count and value sum (`Wq`, `WqSum`).
+4. Read orphaned count, global floor, configured capacity and current number of live entries.
+5. Recompute the current unmonitored upper bound (`Ubar`) from the floor and retained entries.
+6. Copy rejection counters for dimension, non-finite vector, zero norm and invalid value.
+7. Copy probation and merge diagnostics, including `Promoted`, `ReAnchored`, `Dissolved`, `Fused`, `Aliased` and `Dropped`.
+8. Release the lock and return a by-value `Stats` object.
+
+**State mutation**
+
+None. `Stats()` is a consistent sketch-level diagnostic read, not a byte-level memory measurement.
+
+```mermaid
+flowchart LR
+    S[Stats] --> L[Lock summary]
+    L --> G[Read confident and quarantined totals]
+    G --> U[Compute Ubar and capacity usage]
+    U --> D[Copy rejection and lifecycle counters]
+    D --> R[Unlock and return Stats]
+```
+
+Use `Live`, `Capacity`, `Wq`, `Orphaned`, `Floor` and `Ubar` to inspect saturation and uncertainty. A high `Wq` means observations were not confidently assigned; `Orphaned` tracks quarantined count whose counter was evicted, dropped or dissolved.
+
+### 8. `Clone()` creating a point-in-time copy
 
 ```go
 snapshot := summary.Clone()
 ```
 
-`Clone` locks the live sketch, deep-copies its representative, aggregate, uncertainty, exemplar, configuration, and diagnostic state, then returns an independent summary. Later writes to the live summary do not change the clone.
+**Execution flow**
 
-Use a clone for hourly reports, persistence staging, exports, or comparing application-level snapshots. `MarshalBinary` serializes a summary into CDNX bytes; `semantic.Unmarshal` restores those bytes. A clone is a stable in-memory logical state, while serialization is the portable representation of that state.
+1. Acquire the source sketch lock.
+2. Allocate a new sketch identity for the clone.
+3. Copy configuration and all sketch-wide totals and diagnostics.
+4. Reuse the existing encoder reference, which is immutable after construction.
+5. Allocate a new live-counter slice.
+6. Deep-copy each counter's aggregate and uncertainty values, representative code words, aliases, probation member codes and exemplar list.
+7. Release the source lock and return an independent mutable sketch.
 
-The implementation protects sketch methods with a mutex, including `Clone`, but it does not expose a multi-sketch transaction or a globally coordinated snapshot.
+**State mutation**
 
-### Merging distributed summaries
+The original sketch is unchanged. Subsequent `Add` or `Merge` operations on either sketch do not mutate the other's live counters. The immutable encoder may be shared safely.
 
-**Implemented:**
+```mermaid
+flowchart LR
+    A[Clone] --> L[Lock source]
+    L --> B[Copy global state and config]
+    B --> C[Deep-copy codes, counters, members, aliases and exemplars]
+    C --> D[Reuse immutable encoder]
+    D --> E[Return independent Sketch]
+```
+
+`Clone()` is the implemented snapshot operation. There is no separate public `snapshot()` method in model v0. A clone is an in-memory sketch, not serialized bytes.
+
+### 9. `MarshalBinary()` exporting state
+
+```go
+data, err := summary.MarshalBinary()
+```
+
+**Execution flow**
+
+1. Acquire the sketch lock to obtain a consistent state view.
+2. Encode the sketch configuration, including dimension, capacity, thresholds, bit width, value bounds, exemplar/probation limits and seed.
+3. Encode sketch-wide counters, compensated sums, rejection diagnostics and lifecycle diagnostics.
+4. Write the number of retained entries.
+5. For each entry, encode genuine and inherited aggregate fields, ID and compact code, provisional/seed metadata, aliases, probation members, ambiguity fields and exemplars.
+6. Wrap the parameter bytes and payload in the versioned **CDNX semantic envelope**.
+7. Release the lock and return the byte slice or an error.
+
+**State mutation**
+
+None. The resulting bytes are a portable representation of the state captured under the lock.
+
+```mermaid
+flowchart LR
+    A[MarshalBinary] --> B[Lock and read state]
+    B --> C[Encode params]
+    C --> D[Encode global state and each entry]
+    D --> E[Frame CDNX envelope]
+    E --> F[Return bytes]
+```
+
+### 10. `Unmarshal()` and `UnmarshalBinary()` restoring state
+
+```go
+restored, err := semantic.Unmarshal(data)
+
+// Or replace an existing sketch's state.
+err = summary.UnmarshalBinary(data)
+```
+
+**Execution flow**
+
+1. Read and validate the CDNX envelope for the semantic sketch kind.
+2. Decode configuration fields and reject malformed or excessively large dimensions/capacities.
+3. Construct a fresh temporary sketch using the decoded parameters and seeded encoder.
+4. Decode global counts, sums, floors, rejection counters and lifecycle diagnostics.
+5. Decode retained entries, compact code lengths, inherited and genuine aggregates, aliases, probation members, ambiguity and exemplars.
+6. Validate encoded structures, including code size, finite numeric fields, unique retained IDs, exemplar ordering and configured limits.
+7. If decoding fails, return an error. `UnmarshalBinary` leaves the existing receiver unchanged.
+8. If decoding succeeds, lock the receiver and replace its configuration, encoder, counters and global state with the decoded temporary state.
+9. Return the restored sketch or `nil` error.
+
+**Difference between the two functions**
+
+`semantic.Unmarshal(data)` creates a new sketch. `summary.UnmarshalBinary(data)` replaces the receiver's state only after the temporary decode succeeds.
+
+```mermaid
+flowchart TD
+    A[CDNX bytes] --> B{Validate envelope and parameters}
+    B -->|Invalid| E[Return error; receiver unchanged]
+    B -->|Valid| C[Decode into temporary sketch]
+    C --> D{Payload and state valid?}
+    D -->|No| E
+    D -->|Yes| F[Atomically replace receiver state under lock]
+    F --> G[Return restored sketch]
+```
+
+### 11. `Merge()` combining worker summaries
 
 ```go
 err := workerA.Merge(workerB)
 ```
 
-`Merge` modifies the receiver and leaves the source summary unchanged. It requires both values to be semantic sketches with exactly equal parameters. The engine:
+**Input and mutation contract**
 
-1. validates compatibility and avoids self-merge;
-2. reads retained entries in deterministic ID order;
-3. fuses clear compatible matches;
-4. records aliases for ambiguous nearby representatives;
-5. carries counter/aggregate uncertainty rather than treating estimates as exact observations;
-6. applies floors for mass that is not explicitly represented on one side;
-7. trims to `Capacity` and records dropped/orphaned information;
-8. runs deferred probation checks.
+The receiver (`workerA`) is modified in place. The source (`workerB`) remains unchanged. The method accepts a sketch interface, but the source must be a semantic sketch with **exactly equal parameters**. It rejects self-merge and incompatible sketches.
 
-The merged summary is compact and deterministic for the same pair of states. Because reconciliation and capacity trimming are lossy, applications should not expect every merge order to create identical semantic groupings.
+**Execution flow**
 
-## Distributed processing
+1. Check the source sketch type, reject self-merge and compare parameter structs for exact equality.
+2. Lock both sketches in instance-sequence order to avoid lock-order deadlock.
+3. Compute each side's unmonitored upper bound before merging.
+4. Preserve the receiver's pre-merge entry list as the geometric reconciliation reference.
+5. Sort source entries by ascending entity ID.
+6. For each source entry, classify its compact representative code against the receiver's **pre-merge** entries, not newly added entries.
+7. **Confident match.** Fuse genuine counts and compensated sums, inherited uncertainty, attached ambiguity, exemplar sets and aliases into the receiver entry. The destination keeps its representative code.
+8. **Ambiguous nearby match.** Clone the source entry and create bidirectional aliases with up to two nearby receiver entries. Do not confidently fuse their counts.
+9. **No nearby match.** Clone the source entry into the candidate merged set.
+10. Add the opposite sketch's unmonitored upper bound as a floor contribution to entries not confidently fused across sides.
+11. Combine existing and added entries. If the total exceeds `Capacity`, sort by descending count upper bound, tie-break by ascending ID, keep the first `Capacity` entries, and update floor, orphaned mass and drop diagnostics for removed entries.
+12. Add global confident and quarantined totals, compensated sums, orphaned mass, rejection counters and lifecycle diagnostics from the source.
+13. Run any deferred probation checks for eligible fused provisional entries, in ascending ID order.
+14. Unlock both sketches and return `nil`.
 
-Each worker ingests raw observations locally. Only compact summaries need to cross the network for merging.
+**Important behavior**
+
+The merge is deterministic for the same two states and execution order, but it is not promised to be exactly associative across arbitrary merge trees. Aliasing is not the same as confidently fusing entities. Inherited mass is carried as approximation metadata rather than relabeled as genuine observations.
 
 ```mermaid
-flowchart LR
-    RA[Raw events A] --> WA[Worker A\nLocal Cardinex]
-    RB[Raw events B] --> WB[Worker B\nLocal Cardinex]
-    RC[Raw events C] --> WC[Worker C\nLocal Cardinex]
-    WA --> M[Merge engine]
-    WB --> M
-    WC --> M
-    M --> CS[Combined Cardinex]
+flowchart TD
+    A[Receiver A + source B] --> V{Same semantic type and exact params?}
+    V -->|No| E[Return incompatible or self-merge error]
+    V -->|Yes| L[Lock both sketches in stable order]
+    L --> UB[Read unmonitored bounds from A and B]
+    UB --> SORT[Sort B entries by ID]
+    SORT --> C{Classify each B entry against original A entries}
+    C -->|Clear| F[Fuse aggregates, uncertainty, aliases and exemplars]
+    C -->|Ambiguous| AL[Clone B entry; record reciprocal aliases]
+    C -->|No match| CL[Clone B entry]
+    F --> FLOOR[Apply missing-side floors]
+    AL --> FLOOR
+    CL --> FLOOR
+    FLOOR --> CAP[Keep highest-upper-bound entries within Capacity]
+    CAP --> TOTAL[Combine global totals and diagnostics]
+    TOTAL --> PROB[Run deferred probation checks]
+    PROB --> DONE[Unlock with receiver updated]
 ```
 
-Use the same model, dimension, thresholds, quantization settings, value range, seed, and remaining semantic parameters on every worker. If configurations differ, `Merge` returns an incompatibility error. If an application changes embedding models, begin a separate summary rather than merging incompatible vector spaces.
+### 12. `Diff()` comparing two summaries
+
+```go
+deltas, err := current.Diff(previous)
+```
+
+**Meaning of the result**
+
+The implemented operation returns **entity-level `current - previous` differences** for count, sum and mean. It does not compute Wasserstein distance, embedding-space transport, or an overall semantic drift score.
+
+**Execution flow**
+
+1. Reject comparison of the sketch with itself and reject unequal parameter configurations.
+2. Lock both sketches in stable instance order.
+3. Compute each sketch's unmonitored upper bound.
+4. Build fallback entity intervals representing an entity absent from one side's retained counters.
+5. Sort the receiver's entries by entity ID.
+6. For each receiver entry, classify its representative code against the other sketch using the same matching rule as `Merge`.
+7. **Confidently matched.** Construct both public entity views, subtract count/sum/mean intervals, record both IDs and mark both sides present.
+8. **Not confidently matched.** Compare the receiver entity against the other side's unmonitored fallback interval and mark the result as receiver-only.
+9. Iterate the other sketch's entries in ID order. For every entry not used by a confident match, compare the receiver's unmonitored fallback against that entity and mark the result as other-only.
+10. Mark `Significant = true` when the resulting **count-difference interval excludes zero**.
+11. Return results in this order, matched pairs, receiver-only entries, then other-only entries. Unlock both sketches.
+
+**State mutation**
+
+None. `Diff` does not merge, insert, or modify either summary.
+
+**Result fields**
+
+Each `EntityDelta` includes `IDA`, `IDB`, `InA`, `InB`, count/sum/mean difference estimates and `Significant`. Missing IDs are represented as zero, with presence flags clarifying which side contains the entry.
+
+```mermaid
+flowchart TD
+    A[Diff A minus B] --> V{Compatible and distinct sketches?}
+    V -->|No| ERR[Return error]
+    V -->|Yes| UB[Read unmonitored bounds]
+    UB --> LOOP[Walk A entries by ID]
+    LOOP --> M{Clear match in B?}
+    M -->|Yes| BOTH[Compare A entity with B entity]
+    M -->|No| ONLYA[Compare A entity with B fallback]
+    BOTH --> LEFT[Walk remaining unmatched B entries]
+    ONLYA --> LEFT
+    LEFT --> ONLYB[Compare A fallback with B entity]
+    ONLYB --> OUT[Return matched, A-only, B-only deltas]
+```
+
+**How to interpret `Significant`**
+
+It means the computed count-difference interval is strictly above or below zero. It is not a statistical hypothesis test or a guarantee that two embedding distributions are globally different.
+
+### 13. Other public helpers
+
+These are smaller operations but still have defined execution behavior.
+
+| Function | Execution flow | Return / effect |
+| --- | --- | --- |
+| `DefaultSemanticParams(dim, tau, seed)` | Construct a parameter value with default capacity, band, bit width, value range, exemplar limit and probation setting. | Returns a configuration value; does not create a sketch. |
+| `Params()` | Read the sketch's stored parameter struct. | Returns configuration by value; no mutation. |
+| `Encoder()` | Return the sketch's initialized encoder reference. | The encoder is immutable after construction and can be reused for compatible codes. |
+| `Kind()` | Return the semantic sketch-kind identifier. | Used by generic sketch and serialization dispatch. |
+| `TauRange(...)` | Validate geometric inputs and calculate an allowable threshold range. | Returns lower/upper threshold values or an error. Optional configuration helper, not part of ingestion. |
+| `TauFor(...)` | Call `TauRange`, then select the midpoint of its valid interval. | Returns a suggested threshold or an error. |
+| `cardinex.New(kind, params)` | Dispatch to the registered sketch constructor by kind and JSON parameters. | Returns a generic sketch or an error. |
+| `cardinex.Decode(bytes)` | Inspect the CDNX kind and dispatch to the corresponding decoder. | Returns a generic restored sketch or an error. |
+
+`quant.Code.Clone()` also deep-copies packed code words. `quant.Encoder.Encode()` performs validation, normalization, rotation and quantization. `quant.Encoder.Distance()` estimates angular distance between compatible compact codes. These are lower-level quantization operations, not separate semantic-summary mutations.
+
+### 14. `memory_bytes()` planned, not implemented
+
+Model v0 does **not** expose a public `memory_bytes()` method. `Stats()` reports capacity and operational counts, not analytical byte usage.
+
+A future byte-accounting operation would need to inspect the sketch configuration, packed representative codes, counter and aggregate fields, aliases, probation members, exemplar arrays, encoder state and other retained metadata. It should report an analytical state-size estimate rather than process RSS.
+
+Likewise, `snapshot()` is not a separate public method. Use `Clone()`.
 
 ## Complete developer journey
 
-This example uses customer-support analytics.
+A customer-support analytics service can use the functions together in this sequence.
 
-1. **Choose an embedding model.** Select a model and keep its dimension and preprocessing consistent for the lifetime of a summary.
-2. **Create Cardinex.** Set `Dim`, `Tau`, `Capacity`, value range, and compression/exemplar settings with `DefaultSemanticParams` or `semantic.Params`.
-3. **Ingest messages.** Persist the original message in application storage, generate its embedding, and call `Add(embedding, severity, itemID)`.
-4. **Query an issue.** Embed “payment rejected at checkout” with the same model and call `Lookup`. A confident match returns its aggregate interval and exemplar IDs.
-5. **Find frequent issues.** Call `TopK(10, ByCount)` to populate an approximate issue dashboard.
-6. **Inspect state.** Call `Stats` to check live capacity, quarantined observations, replacement-related orphaned mass, and input rejections. A byte-level memory method is not yet available.
-7. **Capture a reporting point.** Call `Clone` hourly and serialize the clone if it must leave the process.
-8. **Scale out.** Run compatible summaries per worker, then merge into an aggregation summary when partitions complete.
-9. **Display results.** Show count/sum/mean intervals and indicate ambiguity rather than presenting estimates as exact counts.
+```mermaid
+flowchart TD
+    MODEL[Choose one embedding model] --> NEW[NewSemantic with matching dimension and params]
+    NEW --> STORE[Store raw event in application database]
+    STORE --> EMB[Generate embedding]
+    EMB --> ADD[Add or AddBatch]
+    ADD --> READ[Lookup an issue / TopK frequent issues]
+    READ --> MON[Stats for capacity and uncertainty]
+    MON --> SNAP[Clone at reporting checkpoint]
+    SNAP --> SAVE[MarshalBinary to persistent storage]
+    SAVE --> LOAD[Unmarshal for recovery]
+    LOAD --> SCALE[Merge compatible worker summaries]
+    SCALE --> COMP[Diff checkpoints for entity-level changes]
+```
 
-Conceptual APIs sometimes call steps 6 and 7 `memory_bytes()` and `snapshot()`. In this repository, use `Stats()` and `Clone()` respectively.
+1. **Configure.** Pick an external embedding model and a consistent preprocessing policy. Create a sketch with matching `Dim`, `Tau`, `Band`, `Bits`, `Capacity` and `Seed`.
+2. **Ingest.** Keep raw messages in your own database. Embed each message and call `Add` or `AddBatch` with a bounded score and an item ID.
+3. **Investigate a concept.** Embed a representative question and call `Lookup`. If a clear entity is returned, inspect its count/sum/mean intervals and exemplar IDs. Fetch human-readable examples from your own database.
+4. **Rank current issues.** Call `TopK` to obtain the highest-ranked retained entities. Display approximation intervals rather than claiming exact counts.
+5. **Monitor uncertainty.** Call `Stats`. Track `Live`, `Wq`, `Orphaned`, rejection counters and promotion/replacement-related diagnostics.
+6. **Create a reporting checkpoint.** Call `Clone`, then `MarshalBinary` to store a consistent summary. Use `Unmarshal` when restoring it.
+7. **Scale horizontally.** Maintain one compatible sketch per worker or partition. Merge completed summaries into an aggregation sketch.
+8. **Compare reporting periods.** Call `Diff` between compatible checkpoints to obtain per-entity count, sum and mean changes. Treat unmatched entities and wide intervals cautiously.
 
-## Service and SDK integration
+## Distributed execution
 
-The C ABI in [`capi/cardinex.h`](capi/cardinex.h) exposes creation, semantic add/add-batch, top-k, lookup, diff, merge, stats, marshal, and unmarshal. SDK directories provide Go, Python, C++, C#, Java, Node.js, and Rust bindings.
+```mermaid
+flowchart LR
+    EA[Raw events A] --> WA[Worker A local Cardinex]
+    EB[Raw events B] --> WB[Worker B local Cardinex]
+    EC[Raw events C] --> WC[Worker C local Cardinex]
+    WA --> M[Merge into aggregator]
+    WB --> M
+    WC --> M
+    M --> CS[Combined Cardinex]
+    CS --> READ[Lookup / TopK / Stats]
+    CS --> PERSIST[Clone / MarshalBinary]
+```
 
-The HTTP service exposes semantic creation, batch add, top-k, lookup, entity-delta diff, exemplars, stats, export/import, and merge routes. Service writes use `batch_id` for idempotency. With a requested tolerance, answers whose interval is wider than that value receive `insufficient_confidence`.
+Only compact summary state needs to cross the network for a merge. `Merge` operates on compatible sketch instances and modifies its receiver. If an application requires the original worker summaries to remain unchanged, merge into a clone rather than directly into a worker's live sketch.
 
-`Diff` is implemented as per-entity count/sum/mean delta comparison between compatible summaries. It is separate from `Merge` and should not be treated as a general semantic-distance or raw-data comparison API.
+**Compatibility requirement**
 
-## Practical use cases
+Model v0 compares the full parameter struct. It does not verify external embedding-model provenance. Workers must therefore use the same embedding model and preprocessing, as well as identical Cardinex parameters. Different merge orders can yield different retained semantic groupings because reconciliation and capacity trimming are lossy.
 
-| Use case | Input and Cardinex operations | Expected output |
-| --- | --- | --- |
-| Customer feedback analytics | Message embeddings plus severity/sentiment values; `Add`, `Lookup`, `TopK`. | Retained complaint groups, approximate counts, aggregate intervals, example IDs. |
-| LLM evaluation | Embeddings of failure descriptions plus bounded score/loss. | Repeated error-pattern summaries and aggregate score information. |
-| Agentic AI monitoring | Embedded agent observations and tool failures; `Add`, `Stats`, `TopK`. | Recurring behavior or failure candidates with bounded summary state. |
-| Training-data analytics | Embeddings and bounded quality signals. | Repetitive retained regions and lightweight aggregate summaries. |
-| Distributed event processing | Per-worker summaries followed by compatible `Merge`. | Compact combined state without replaying raw events. |
+## Configuration
 
-## Configuration and memory management
-
-`DefaultSemanticParams(dim, tau, seed)` supplies defaults. Customize fields before construction:
-
-- `Capacity` controls the maximum number of live entries.
-- `Tau` controls how close a clear match must be.
-- `Band` reserves uncertainty around the threshold; larger bands report more ambiguous observations instead of forcing assignments.
-- `Bits` selects compact-code precision: 1, 2, or 4.
-- `ValueMin` and `ValueMax` must cover every supplied value.
-- `Exemplars` limits retained item IDs per entity.
-- `Probation` controls how provisional representatives are checked; zero disables it.
-- `Seed` must match across sketches that need to merge.
-
-Tune capacity and compression against the quality your application needs. Watch `Stats().Live`, `Stats().Wq`, `Stats().Orphaned`, and rejection counters; they reveal saturation, ambiguity, replacement effects, and bad inputs.
-
-## Limitations
-
-- Statistics are approximate and include intervals or ambiguity metadata.
-- Similar embeddings are not necessarily the same real-world concept.
-- A concept can fragment across multiple retained entities.
-- Capacity saturation causes replacement and can reduce representation quality.
-- Model v0 has one shared capacity, not separate center/counter budgets.
-- `Lookup` returns only clear matches; it does not provide arbitrary nearest-neighbor retrieval.
-- Merging requires exact configuration compatibility and may be sensitive to merge order.
-- Changing embedding models or preprocessing invalidates direct comparison and merging.
-- Cardinex retains item IDs, not raw data; use your own storage for exact retrieval.
-
-## Roadmap
-
-Possible future work includes a public analytical `memory_bytes()` method, a named snapshot API, separate geometric and frequency budgets, richer semantic-group reconciliation, and additional distribution-comparison operations. These are not available features in model v0.
-
-## Repository layout and installation
-
-| Path | Contents |
+| Parameter | Runtime effect |
 | --- | --- |
-| `core/semantic` | Semantic sketch, aggregation, query, merge, and serialization. |
-| `core/quant` | Embedding rotation and compact encoding. |
-| `core/classic` | HyperLogLog, Count-Min, and Bloom sketches. |
-| `capi` | C ABI. |
-| `sdk` | Language bindings. |
-| `service` | HTTP and MCP services. |
-| `conformance`, `bench`, `experiments` | Fixtures, benchmarks, and utilities. |
+| `Dim` | Required vector dimension; invalid lengths are rejected. |
+| `Capacity` | Maximum number of retained live entries; full capacity triggers lowest-upper-bound replacement for unmatched observations. |
+| `Tau` | Center of the angular matching threshold. |
+| `Band` | Ambiguity band. A confident match must be uniquely within `Tau - Band`; candidates are considered through `Tau + Band`. |
+| `Bits` | Packed code precision, 1, 2 or 4 bits. |
+| `ValueMin`, `ValueMax` | Allowed nonnegative finite observation value range. |
+| `Exemplars` | Maximum retained distinct item IDs per entity. |
+| `Probation` | Number of distinct member codes required for a provisional promotion check; zero disables probation. |
+| `Seed` | Controls deterministic encoding and seeded policies; must match for merges. |
+| `Refine` | Unsupported in model v0; enabling it causes construction to fail. |
+
+Lower code precision reduces representative storage but can change estimated angular distances and therefore assignment decisions. Increasing `Capacity` permits more retained entities but also increases scan work and state size.
+
+## SDKs and service
+
+The repository contains a pure-Go SDK, a C ABI, and bindings for Python, C++, C#, Java, Node.js and Rust. The HTTP service exposes semantic creation, batch ingestion, lookup, top-k, per-entity diff, exemplars, stats, export/import and merge routes.
+
+The service supports `batch_id` for idempotent writes. This service-level behavior does **not** make the core `Add` API deduplicating or exactly-once. Service response tolerance handling may report `insufficient_confidence` when an estimate interval is too wide.
+
+The Go function names in this README are the authoritative names for the Go semantic engine. Other SDKs may use different naming conventions and signatures.
+
+## Operational boundaries
+
+- Similar embeddings are not guaranteed to be the same real-world concept.
+- The confident-match rule can quarantine a vector even when a nearest representative exists.
+- An observation can be attached as ambiguity to up to two candidate entries, while global quarantined mass counts it once.
+- One semantic concept may fragment across multiple retained representatives.
+- A full sketch may evict a retained entry when an unmatched observation arrives.
+- Counter inherited mass is approximation accounting, not genuine observations of the replacement entity.
+- `Lookup` returns a clear entity or `false`; it is not a nearest-neighbor retrieval API.
+- `TopK` ranks retained IDs, not guaranteed canonical semantic topics.
+- `Diff` compares entity aggregate intervals, not embedding-distribution distance.
+- `Merge` requires exact parameter compatibility and may depend on merge order.
+- `AddBatch` prevalidates the full batch but may increment rejection diagnostics on failure.
+- Raw messages are not stored, and core ingestion does not deduplicate repeated observations.
+- Analytical byte-level `memory_bytes()` and a separately named `snapshot()` API are not implemented.
+
+## Repository and build
+
+| Path | Responsibility |
+| --- | --- |
+| [`core/semantic`](core/semantic) | Semantic ingestion, matching, aggregation, query, merge, diff and serialization. |
+| [`core/quant`](core/quant) | Normalization, randomized-Hadamard rotation, compact codes and angular-distance estimates. |
+| [`core/classic`](core/classic) | HyperLogLog, Count-Min and Bloom implementations. |
+| [`capi`](capi) | Native C ABI. |
+| [`sdk`](sdk) | Language bindings. |
+| [`service`](service) | HTTP and MCP services. |
+| [`conformance`](conformance), [`bench`](bench), [`experiments`](experiments) | Fixtures, benchmarks and utilities. |
 
 ```sh
-make build        # Build Go packages
-make test         # Run Go tests
-make lib          # Build the native library (C compiler required)
-make conformance  # Run Go + Python conformance path
-make cross        # Cross-build with zig cc
+make build
+make test
+make lib
+make conformance
+make cross
 docker compose up --build
 ```
 
-Service configuration: `ADDR`, `REDIS_ADDR`, `FLUSH_INTERVAL` (default `5s`), `LOG_WRITES` (default `1`), and `CARDINEX_API_KEY`.
+Service configuration includes `ADDR`, `REDIS_ADDR`, `FLUSH_INTERVAL`, `LOG_WRITES` and `CARDINEX_API_KEY`.
 
-## License and contributing
+## License
 
-Cardinex is available under the [MIT License](LICENSE). Contributions should preserve API accuracy, document compatibility requirements, and keep planned features clearly separate from implemented behavior.
+Cardinex is available under the [MIT License](LICENSE).
